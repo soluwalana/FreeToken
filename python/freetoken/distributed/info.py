@@ -35,4 +35,24 @@ def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
 
 
-__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info"]
+# Overwritable: one process's tests load rank 0 and then rank 1. Size 1 owns every expert.
+_EP_INFO: DistributedInfo = DistributedInfo(0, 1)
+
+
+def set_ep_info(rank: int, size: int) -> None:
+    global _EP_INFO
+    _EP_INFO = DistributedInfo(rank, size)
+
+
+def get_ep_info() -> DistributedInfo:
+    return _EP_INFO
+
+
+__all__ = [
+    "DistributedInfo",
+    "set_tp_info",
+    "get_tp_info",
+    "try_get_tp_info",
+    "set_ep_info",
+    "get_ep_info",
+]

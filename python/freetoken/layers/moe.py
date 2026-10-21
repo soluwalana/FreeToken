@@ -198,7 +198,7 @@ class OffloadMoELayer(MoELayer):
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
-        return self._maybe_all_reduce(final_hidden_states)
+        return self._reduce_routed(final_hidden_states)
 
     def routed_forward(
         self,
@@ -221,7 +221,27 @@ class OffloadMoELayer(MoELayer):
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
-        return self._maybe_all_reduce(out)
+        # Shared experts are added by the caller after this returns. Reducing
+        # routed+shared would multiply the shared MLP by the expert-parallel size.
+        return self._reduce_routed(out)
+
+    def _reduce_routed(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from freetoken.moe.expert_parallel import get_ep_comm
+
+        comm = get_ep_comm()
+        if comm.size > 1:
+            return comm.all_reduce(hidden_states)
+        return self._maybe_all_reduce(hidden_states)
+
+    def _mask_ep(self, topk_weights: torch.Tensor, topk_ids: torch.Tensor):
+        from freetoken.distributed import get_ep_info
+        from freetoken.moe.expert_parallel import mask_routes
+
+        if get_ep_info().size <= 1:
+            return topk_weights, topk_ids
+        cache = self.offload_cache
+        assert cache is not None and cache.ep_pad is not None
+        return mask_routes(topk_ids, topk_weights, cache.ep_pad)
 
     def decode_forward(
         self,
@@ -281,6 +301,7 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        topk_weights, topk_ids = self._mask_ep(topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -354,6 +375,10 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        topk_weights, topk_ids = self._mask_ep(topk_weights, topk_ids)
+        # Position == local bank row. Under expert parallelism that count includes the
+        # zero pad row and is smaller than the router's global expert count.
+        n = cache.num_experts
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -362,7 +387,7 @@ class OffloadMoELayer(MoELayer):
                 topk_weights,
                 topk_ids,
                 views=views,
-                n=self.num_experts,
+                n=n,
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
@@ -376,7 +401,7 @@ class OffloadMoELayer(MoELayer):
             topk_weights,
             topk_ids,
             views=cache.stage_views(self.layer_id, 0),
-            n=self.num_experts,
+            n=n,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )

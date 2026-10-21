@@ -71,9 +71,11 @@ def iter_expert_pieces(
         if spec_hook is None:
             raise NotImplementedError(f"{spec.module} provides no nvfp4_expert_spec")
         from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces
+        from freetoken.moe.expert_parallel import is_rank0
 
         return iter_nvfp4_expert_pieces(
-            model_path, config, spec_hook(model_path, config), layers=layers, parallel=parallel, workers=workers, chunk=chunk
+            model_path, config, spec_hook(model_path, config), layers=layers, parallel=parallel,
+            workers=workers, chunk=chunk, primary=is_rank0(),
         )
     raise NotImplementedError(f"{spec.module} provides no expert reader for {kind!r} experts")
 
@@ -99,6 +101,12 @@ def _source_layer(key: str) -> int | None:
 
 def stacked_expert_pieces(tensors: Iterable[tuple[str, torch.Tensor]], config, *, layers: Collection[int] | None = None) -> Iterator[Piece]:
     """Whole-layer ``experts.gate_up_proj`` / ``experts.down_proj`` tensors -> one piece per layer, for ``layers`` (bank layer ids, default all)."""
+    from freetoken.distributed import get_ep_info
+
+    if get_ep_info().size > 1:
+        raise ValueError(
+            "expert parallelism needs per-expert checkpoint tensors; stacked expert weights are not split"
+        )
     keep = None if layers is None else set(layers)
     pending: dict[int, dict[str, torch.Tensor]] = {}
     num_experts = config.num_experts

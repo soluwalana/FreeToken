@@ -37,6 +37,13 @@ from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
 
+def _collective_size(config) -> int:
+    """World size of the gloo group this scheduler barriers on (tensor or expert parallel)."""
+    ep = getattr(config, "ep_info", None)
+    ep_size = 1 if ep is None else getattr(ep, "size", 1)
+    return max(config.tp_info.size, ep_size)
+
+
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
 
@@ -181,7 +188,7 @@ class Scheduler(SchedulerIOMixin):
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
         torch.cuda.synchronize(self.device)
-        if self.config.tp_info.size > 1:
+        if _collective_size(self.config) > 1:
             self.sync_all_ranks()
         self.engine.rebuild_runtime_cache(
             moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
@@ -208,7 +215,7 @@ class Scheduler(SchedulerIOMixin):
             min(self.config.max_extend_tokens, _chunk_cap)
             if _chunk_cap else self.config.max_extend_tokens
         )
-        if self.config.tp_info.size > 1:
+        if _collective_size(self.config) > 1:
             self.sync_all_ranks()
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
@@ -606,9 +613,14 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(
                     msg.request_id, "unsupported", f"mode {msg.mode!r} unsupported (use if_idle)"
                 )
-            elif self.config.tp_info.size > 1:
+            elif _collective_size(self.config) > 1:
+                kind = (
+                    "expert parallelism"
+                    if getattr(getattr(self.config, "ep_info", None), "size", 1) > 1
+                    else "TP > 1"
+                )
                 self._reply_rebuild(
-                    msg.request_id, "unsupported", "runtime rebuild unsupported under TP > 1"
+                    msg.request_id, "unsupported", f"runtime rebuild unsupported under {kind}"
                 )
             elif self.prefill_manager.runnable or self.decode_manager.runnable:
                 # if_idle: refuse rather than wait. (finished_reqs hold no resources — they
@@ -699,11 +711,11 @@ class Scheduler(SchedulerIOMixin):
                 logger.error(f"cache rebuild failed before teardown: {e!r} — old cache intact")
                 self._reply_rebuild(msg.request_id, "rejected", error=repr(e))
                 return
-            if self.config.tp_info.size > 1:
-                # A lone-rank failure cannot be rolled back symmetrically: rebuild_cache runs TP
+            if _collective_size(self.config) > 1:
+                # A lone-rank failure cannot be rolled back symmetrically: rebuild_cache runs
                 # barriers, and ranks that succeeded will not re-enter them — a solo rollback
-                # would desync the group. Keep the latch-failed behavior for tp>1.
-                logger.error(f"cache rebuild failed: {e!r} — tp>1, latching failed")
+                # would desync the group. Keep the latch-failed behavior when a collective is live.
+                logger.error(f"cache rebuild failed: {e!r} — collective size > 1, latching failed")
                 self._reply_rebuild(msg.request_id, "failed", error=repr(e))
                 return
             # The destructive phase failed — typically a CUDA OOM while reallocating a pool or

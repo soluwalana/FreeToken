@@ -28,7 +28,7 @@ import re
 from typing import Iterator
 
 import torch
-from freetoken.distributed import get_tp_info
+from freetoken.distributed import get_ep_info, get_tp_info
 from freetoken.layers.quantization import QuantKind
 from freetoken.models.glm_moe_dsa.weight import _ShardReader
 from freetoken.models.loader import drop_page_cache
@@ -187,7 +187,7 @@ def iter_weights(
     with open(os.path.join(folder, "model.safetensors.index.json")) as f:
         weight_map = json.load(f)["weight_map"]
     reader = _ShardReader(folder, weight_map, device)
-    primary = get_tp_info().is_primary()
+    primary = get_tp_info().is_primary() and get_ep_info().is_primary()
     try:
         for layer in tqdm(
             range(config.num_layers),
@@ -257,6 +257,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
     if get_tp_info().size > 1:
         raise NotImplementedError("glm5_next fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
+    from freetoken.moe.expert_parallel import is_rank0, remap_expert
     from freetoken.moe.expert_pieces import per_expert_pieces
 
     suffix = {"weight": "", "weight_scale_inv": "_scale"}
@@ -269,7 +270,10 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
         bank = _layer_to_bank(int(m["layer"]), config)
         if bank is None or (keep is not None and bank not in keep):
             return None
-        return bank, int(m["expert"]), m["proj"] + suffix[m["kind"]]
+        row = remap_expert(int(m["expert"]))
+        if row is None:
+            return None
+        return bank, row, m["proj"] + suffix[m["kind"]]
 
     if parallel is None:
         parallel = experts_scattered(model_path)
@@ -289,8 +293,10 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
                 layer for layer in range(config.first_k_dense_replace, config.num_layers)
                 if keep is None or _layer_to_bank(layer, config) in keep
             ]
-            for layer in tqdm(ckpt_layers, desc="Loading GLM-5.3 fp8 experts (serial)", disable=not get_tp_info().is_primary()):
+            for layer in tqdm(ckpt_layers, desc="Loading GLM-5.3 fp8 experts (serial)", disable=not is_rank0()):
                 for e in range(config.num_experts):
+                    if remap_expert(e) is None:
+                        continue
                     base = f"{_CKPT}.layers.{layer}.mlp.experts.{e}"
                     for proj in ("gate", "up", "down"):
                         for kind_name in suffix:

@@ -26,13 +26,18 @@ class SchedulerIOMixin:
 
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
         tp_info = config.tp_info
+        ep_info = config.ep_info
+        # Sockets belong to one process. tp size 1 makes every rank primary, so expert
+        # parallel selects the owner with ep rank 0 as well.
+        owns_sockets = tp_info.is_primary() and ep_info.is_primary()
+        multi_rank = tp_info.size > 1 or ep_info.size > 1
         self.tp_cpu_group: Final = tp_cpu_group
         if config.offline_mode:
             self.receive_msg = self.offline_receive_msg
             self.send_result = self.offline_send_result
             return  # early exit
 
-        if tp_info.is_primary():
+        if owns_sockets:
             self._recv_from_tokenizer: Final = ZmqPullQueue(
                 config.zmq_backend_addr,
                 create=True,
@@ -46,8 +51,8 @@ class SchedulerIOMixin:
 
         recv = self._recv_msg_single_rank
         send = self._reply_tokenizer_rank0
-        if tp_info.size > 1:
-            if tp_info.is_primary():
+        if multi_rank:
+            if owns_sockets:
                 recv = self._recv_msg_multi_rank0
                 self._send_into_ranks: Final = ZmqPubQueue(
                     config.zmq_scheduler_broadcast_addr, create=True, encoder=BaseBackendMsg.encoder

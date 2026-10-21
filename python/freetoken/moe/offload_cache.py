@@ -344,6 +344,8 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Local expert row pinned into a zero slot when expert parallelism is on. None otherwise.
+        self.ep_pad: int | None = None
         self._slice_pools()
 
     def _pool_layout(self, pool: int) -> int:
@@ -754,6 +756,7 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+        self._pin_ep_pad()
 
     def set_alphas(
         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
@@ -1067,9 +1070,41 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
+    def install_ep_pad(self) -> None:
+        """Pin the padding expert row into a zero slot that ``ensure_experts`` will not fetch.
+
+        The slot index is the pad row itself (the last local bank row). Prefill indexes that
+        bank row; decode indexes this slot. Its LRU usage stays above any real step, so the
+        victim scan never selects it and the zero payload allocated with the slot cache stays
+        zero. Every pool must be large enough to hold that local index.
+        """
+        pad = self.num_experts - 1
+        short = [s for s in self.pool_sizes if s <= pad]
+        if short:
+            raise ValueError(
+                f"expert parallelism reserves local slot {pad} as a zero row; "
+                f"every MoE pool needs at least {self.num_experts} slots "
+                f"(smallest has {min(self.pool_sizes)})"
+            )
+        self.ep_pad = pad
+        self._pin_ep_pad()
+
+    def _pin_ep_pad(self) -> None:
+        pad = self.ep_pad
+        if pad is None:
+            return
+        from freetoken.moe.expert_parallel import EP_PAD_USAGE
+
+        self.slot_for_id[:, pad] = pad
+        for usage in self._pool_usage:
+            usage[pad] = EP_PAD_USAGE
+
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
+        # Re-pin before the lookup: a prefill materialize rewrites slot_for_id, and the
+        # kernel treats slot >= 0 as a hit so the pad row is not copied in.
+        self._pin_ep_pad()
         if self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
@@ -1078,6 +1113,9 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
+        # The hit path stores the current step into the pad slot's usage. Put the
+        # permanent usage back so the next call still refuses to evict it.
+        self._pin_ep_pad()
 
     def ensure_experts_hybrid(
         self, layer_id: int, expert_ids: torch.Tensor, weights: torch.Tensor, clamp: bool = False
@@ -1121,6 +1159,7 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self._pin_ep_pad()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0

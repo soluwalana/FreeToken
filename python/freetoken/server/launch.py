@@ -55,6 +55,26 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     tokenize_worker(**kwargs)
 
 
+def scheduler_rank_args(server_args: ServerArgs, rank: int) -> ServerArgs:
+    """Args for one scheduler worker. Expert parallel keeps ``tp_info`` at (0, 1)."""
+    if server_args.ep_info.size > 1:
+        world = server_args.ep_info.size
+        return replace(
+            server_args, tp_info=DistributedInfo(0, 1), ep_info=DistributedInfo(rank, world)
+        )
+    world = server_args.tp_info.size
+    return replace(server_args, tp_info=DistributedInfo(rank, world))
+
+
+def _parallel_placement(args: ServerArgs) -> tuple[int, int, bool]:
+    """``(rank, world, owns_sockets)``. Sockets belong to tensor rank 0 and expert rank 0."""
+    if args.ep_info.size > 1:
+        rank, world = args.ep_info.rank, args.ep_info.size
+    else:
+        rank, world = args.tp_info.rank, args.tp_info.size
+    return rank, world, args.tp_info.is_primary() and args.ep_info.is_primary()
+
+
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
@@ -62,14 +82,15 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     # published (not bound) here: the engine binds it after the allocator setup
     from freetoken.gpu_select import set_assigned_gpu
 
+    rank, world, owns_sockets = _parallel_placement(args)
     # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank
-    targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
-    set_assigned_gpu(targets[args.tp_info.rank])
+    targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(world))
+    set_assigned_gpu(targets[rank])
 
     import torch
     from freetoken.scheduler import Scheduler
 
-    if args.tp_info.is_primary():
+    if owns_sockets:
         from freetoken.utils.progress import set_progress_sink
 
         set_progress_sink(
@@ -88,7 +109,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             _report_startup_error(ack_queue, exc)
             raise
 
-        if args.tp_info.is_primary():
+        if owns_sockets:
             # Report the real per-unit cache VRAM costs (KV/expert/mamba), the device-wide free
             # VRAM, and the per-pool rebuild floors before the ready ack, so the supervisor has
             # them (and the desktop's slider bounds) by the time the gate flips. Optional +
@@ -116,7 +137,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             scheduler.run_forever()
         except KeyboardInterrupt:
             logger = init_logger(__name__)
-            if args.tp_info.is_primary():
+            if owns_sockets:
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
             scheduler.shutdown()
@@ -158,17 +179,18 @@ def launch_server(
         mp.set_start_method("spawn", force=True)
         detach = server_args.shell_mode  # see _detach_process_group
 
-        world_size = server_args.tp_info.size
+        world_size = server_args.ep_info.size if server_args.ep_info.size > 1 else server_args.tp_info.size
         ack_queue: mp.Queue = mp.Queue()
         processes: list[mp.Process] = []
+        kind = "EP" if server_args.ep_info.size > 1 else "TP"
 
         for i in range(world_size):
-            new_args = replace(server_args, tp_info=DistributedInfo(i, world_size))
+            new_args = scheduler_rank_args(server_args, i)
             p = mp.Process(
                 target=_run_scheduler,
                 args=(new_args, ack_queue),
                 daemon=False,
-                name=f"freetoken-TP{i}-scheduler",
+                name=f"freetoken-{kind}{i}-scheduler",
             )
             p.start()
             processes.append(p)

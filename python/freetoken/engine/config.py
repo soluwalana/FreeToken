@@ -23,6 +23,9 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # Expert parallelism. Size 1 owns every routed expert. Workers keep tp_info at (0, 1)
+    # so linears, embeddings, and KV heads stay whole; ep_info selects the expert shard.
+    ep_info: DistributedInfo = field(default_factory=lambda: DistributedInfo(0, 1))
     # --hf-overrides: applied to the checkpoint config the model is built from (cached_load_hf_config)
     hf_overrides: Mapping[str, Any] = field(default_factory=dict)
     max_running_req: int = 4

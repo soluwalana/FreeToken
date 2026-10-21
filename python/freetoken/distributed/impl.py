@@ -95,3 +95,6 @@ def destroy_distributed() -> None:
     Destroy all the distributed communication plugins.
     """
     DistributedCommunicator.plugins = []
+    from freetoken.moe.expert_parallel import clear_ep_comm
+
+    clear_ep_comm()

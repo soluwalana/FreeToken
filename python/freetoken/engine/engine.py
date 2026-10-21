@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
-from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_ep_info, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
@@ -41,9 +41,51 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
+def _expert_rows(config) -> int:
+    """Bank rows this rank serves. Expert parallel adds one zero pad row to the owned count."""
+    from freetoken.moe.expert_parallel import bank_geometry
+
+    ep = getattr(config, "ep_info", None)
+    size = 1 if ep is None else getattr(ep, "size", 1)
+    return bank_geometry(config.model_config.num_experts, size)[1]
+
+
+def _check_expert_parallel(config: EngineConfig, *, strategy_ready: bool) -> None:
+    """Refuse expert-parallel combinations the dispatch does not implement."""
+    size = config.ep_info.size
+    if size <= 1:
+        return
+    if config.tp_info.size > 1:
+        raise ValueError(
+            "--expert-parallel-size cannot be combined with --tensor-parallel-size greater than 1"
+        )
+    model = config.model_config
+    if not getattr(model, "is_moe", False):
+        raise ValueError("--expert-parallel-size requires a mixture-of-experts model")
+    n = getattr(model, "num_experts", 0) or 0
+    if n <= 0 or n % size:
+        raise ValueError(
+            f"--expert-parallel-size {size} must divide the model's {n} routed experts"
+        )
+    if not strategy_ready:
+        return
+    if config.moe_strategy != "offload":
+        raise ValueError(
+            f"--expert-parallel-size requires --moe-strategy offload "
+            f"(got {config.moe_strategy!r}); cpu, hybrid, and resident experts are unsupported"
+        )
+    if config.moe_cpu_layers:
+        raise ValueError("--moe-cpu-layers cannot be combined with --expert-parallel-size")
+    if str(config.moe_cache_split).startswith("profile"):
+        raise ValueError(
+            "--moe-cache-split profile is unsupported with --expert-parallel-size; "
+            "a profile shaped for the full expert count does not match the local banks"
+        )
+
+
 def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) -> None:
     """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool."""
-    num_experts = config.model_config.num_experts
+    num_experts = _expert_rows(config)
     small = [s for s in pool_sizes if s < num_experts]
     if not small:
         return
@@ -368,12 +410,14 @@ class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        set_ep_info(rank=config.ep_info.rank, size=config.ep_info.size)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
         _ensure_expandable_segments()  # before the first CUDA allocation below
 
         from freetoken.gpu_select import bind_assigned_gpu
 
-        self.device = bind_assigned_gpu(config.tp_info.rank)
+        bind_rank = config.ep_info.rank if config.ep_info.size > 1 else config.tp_info.rank
+        self.device = bind_assigned_gpu(bind_rank)
         _adjust_config(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
@@ -538,6 +582,38 @@ class Engine:
             self._warmup_prefill()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
+        from freetoken.moe.expert_parallel import clear_ep_comm, set_ep_comm
+
+        ep = config.ep_info
+        if ep.size > 1:
+            # gloo world is the expert-parallel group. tp_info stays (0, 1), so the
+            # tensor-parallel plugin is not installed; the MoE layer holds this communicator.
+            torch.distributed.init_process_group(
+                backend="gloo",
+                rank=ep.rank,
+                world_size=ep.size,
+                timeout=timedelta(seconds=config.distributed_timeout),
+                init_method=config.distributed_addr,
+            )
+            group = torch.distributed.group.WORLD
+            assert group is not None
+            max_bytes = (
+                config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
+            )
+            if config.use_pynccl:
+                from freetoken.distributed.impl import PyNCCLDistributedImpl
+                from freetoken.kernel import init_pynccl
+
+                comm = init_pynccl(
+                    tp_rank=ep.rank, tp_size=ep.size, tp_cpu_group=group, max_size_bytes=max_bytes
+                )
+                set_ep_comm(PyNCCLDistributedImpl(comm), ep.size)
+            else:
+                from freetoken.distributed.impl import TorchDistributedImpl
+
+                set_ep_comm(TorchDistributedImpl(), ep.size)
+            return group
+        clear_ep_comm()
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
@@ -655,7 +731,7 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
-        num_experts = config.model_config.num_experts
+        num_experts = _expert_rows(config)
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
@@ -716,9 +792,10 @@ class Engine:
                     for i in range(config.model_config.num_moe_layers)
                 ]
         # read before the expert load, so a bad profile fails in seconds
+        expert_rows = _expert_rows(config)
         expert_counts = resolve_profile(
             config.moe_cache_split, config.model_path,
-            config.model_config.num_moe_layers, config.model_config.num_experts,
+            config.model_config.num_moe_layers, expert_rows,
         )
         try:
             with _weight_load_context():
@@ -787,14 +864,14 @@ class Engine:
             # per_slot is a mean over layers, so with pools of different slot sizes the split can exceed the budget: shrink until it fits
             while size > 0 and self._moe_pool_bytes(split_slots(size, pools, self._moe_expert_counts)) > config.moe_cache_mem:
                 size -= 1
-            overlap = config.moe_prefill_overlap and size >= 2 * config.model_config.num_experts
+            overlap = config.moe_prefill_overlap and size >= 2 * expert_rows
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
             logger.info_rank0(
                 f"--moe-cache-mem {mem_GB(config.moe_cache_mem)} resolved moe_cache_size={size} "
                 f"({per_slot / 2**20:.2f} MiB per slot, prefill_overlap={overlap})"
             )
-        _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+        _require_offload_cache_size(config.moe_cache_size, expert_rows)
         pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
         if len(pools) > 1:
             logger.info_rank0(
@@ -826,7 +903,7 @@ class Engine:
             # Models with leading dense layers (GLM-4) only have experts on the MoE
             # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
             num_layers=config.model_config.num_moe_layers,
-            num_experts=config.model_config.num_experts,
+            num_experts=expert_rows,
             cache_size=config.moe_cache_size,
             device=self.device,
             cache_policy=config.moe_cache_policy,
@@ -841,6 +918,8 @@ class Engine:
             pool_of_layer=pool_of_layer(pools, config.model_config.num_moe_layers),
             pool_sizes=pool_sizes,
         )
+        if config.ep_info.size > 1:
+            cache.install_ep_pad()
         # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
         cache.cpu_layer_ids = cpu_layer_ids
         if locked_fetch:
@@ -905,7 +984,7 @@ class Engine:
     def _moe_pools(self, batch: int) -> list:
         """The slot pools, each with room for the routed experts of ``batch`` decode tokens."""
         model_config = self.config.model_config
-        num_experts = model_config.num_experts
+        num_experts = _expert_rows(self.config)
         min_num_slots = min(num_experts, model_config.num_experts_per_tok * batch)
         return make_pools(self._moe_pool_groups, num_experts, min_num_slots, self._moe_slot_limit)
 
@@ -1754,6 +1833,7 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+    _check_expert_parallel(config, strategy_ready=False)
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
@@ -1858,7 +1938,7 @@ def _adjust_config(config: EngineConfig):
     _validate_attention_backend_choice(config, override, required_attn_types)
 
     if config.moe_cache_rate is not None:
-        total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
+        total_experts = config.model_config.num_moe_layers * _expert_rows(config)
         override("moe_cache_size", math.ceil(total_experts * config.moe_cache_rate))
 
     # The CPU MoE executor supports the silu/gelu family plus the clamped
@@ -1945,6 +2025,8 @@ def _adjust_config(config: EngineConfig):
                 f"auto-selected strategy {config.moe_strategy!r}"
             )
 
+    _check_expert_parallel(config, strategy_ready=True)
+
     if (
         is_moe
         and config.moe_strategy == "offload"
@@ -1989,7 +2071,7 @@ def _adjust_config(config: EngineConfig):
         # the GPU only holds the two-layer prefill double buffer. So the slot cache is
         # fixed at exactly two expert layers (prefill overlap requires >= 2*num_experts)
         # and --moe-cache-size / --moe-cache-auto / --moe-cache-rate do not apply.
-        num_experts = config.model_config.num_experts
+        num_experts = _expert_rows(config)
         if getattr(config, "moe_cache_auto", False):
             override("moe_cache_auto", False)
         override("moe_cache_mem", None)

@@ -319,11 +319,25 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--expert-parallel-size",
+        "--ep-size",
+        type=int,
+        default=1,
+        help=(
+            "Expert parallelism size. Each rank owns a striped share of the routed experts "
+            "and the ranks sum the routed output. Must equal the number of --gpu entries and "
+            "must divide the model's routed expert count (288 for GLM-5.3). Not combined with "
+            "--tensor-parallel-size greater than 1."
+        ),
+    )
+
+    parser.add_argument(
         "--gpu",
         type=_lazy_gpu_arg,
         default=ServerArgs.gpu,
         help=(
-            "GPU(s) to run on, comma-separated; entry i is TP rank i. Each entry is a GPU "
+            "GPU(s) to run on, comma-separated; entry i is rank i (tensor-parallel, or "
+            "expert-parallel when that size is greater than 1). Each entry is a GPU "
             "UUID (GPU-xxxx..., as nvidia-smi -L prints) or an nvidia-smi index"
         ),
     )
@@ -915,13 +929,29 @@ def parse_args(
     kwargs = parser.parse_args(args).__dict__.copy()
 
     # reject a too-long list here with a clear reason, not as a dead rank later
-    if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
-        if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
-            parser.error("tensor parallelism is not supported yet: --gpu takes one entry")
+    ep_size = kwargs["expert_parallel_size"]
+    tp_size = kwargs["tensor_parallel_size"]
+    if ep_size < 1:
+        parser.error("--expert-parallel-size must be at least 1")
+    if ep_size > 1 and tp_size > 1:
+        parser.error("--expert-parallel-size cannot be combined with --tensor-parallel-size greater than 1")
+    if ep_size > 1 and kwargs["moe_strategy"] in ("cpu", "hybrid", "fused"):
         parser.error(
-            f"--gpu has {len(kwargs['gpu'])} entries but --tensor-parallel-size is "
-            f"{kwargs['tensor_parallel_size']}; give one entry per TP rank"
+            f"--expert-parallel-size requires --moe-strategy offload "
+            f"(got {kwargs['moe_strategy']!r}); cpu, hybrid, and resident experts are unsupported"
         )
+    if ep_size > 1 and kwargs["moe_cpu_layers"]:
+        parser.error("--moe-cpu-layers cannot be combined with --expert-parallel-size")
+    world = ep_size if ep_size > 1 else tp_size
+    gpu_n = len(kwargs["gpu"])
+    if gpu_n not in (0, world):
+        if tp_size == 1 and ep_size == 1 and gpu_n > 1:
+            parser.error(
+                f"--gpu has {gpu_n} entries; pass --expert-parallel-size {gpu_n} "
+                "with one GPU per rank"
+            )
+        flag = "--expert-parallel-size" if ep_size > 1 else "--tensor-parallel-size"
+        parser.error(f"--gpu has {gpu_n} entries but {flag} is {world}; give one entry per rank")
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
@@ -1016,7 +1046,9 @@ def parse_args(
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
+    kwargs["ep_info"] = DistributedInfo(0, kwargs["expert_parallel_size"])
     del kwargs["tensor_parallel_size"]
+    del kwargs["expert_parallel_size"]
 
     disabled = set(ENCODER_KINDS) if kwargs.pop("text_model_only") else set()
     disabled.update(kwargs.pop("mm_disable"))

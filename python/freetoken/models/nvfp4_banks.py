@@ -114,8 +114,11 @@ def iter_nvfp4_expert_pieces(
     folder = download_hf_weight(model_path)
     weight_map = safetensors_weight_map(folder)
 
+    from freetoken.moe.expert_parallel import bank_geometry, remap_expert
+
     keep = None if layers is None else set(layers)
     act = _activation_scale()
+    owned, _ = bank_geometry(config.num_experts)
     wanted: dict[str, tuple[int, int, str]] = {}
     for name in weight_map:
         match = spec.key_pattern.match(name)
@@ -130,12 +133,15 @@ def iter_nvfp4_expert_pieces(
         kind = _canon_kind(spec, match.group("kind"))
         if kind not in ("weight", "weight_scale", "weight_scale_2"):
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}")
-        wanted[name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + _kind_suffix(kind))
+        row = remap_expert(int(match.group("expert")))
+        if row is None:
+            continue
+        wanted[name] = (bank_layer, row, spec.proj_to_role[proj] + _kind_suffix(kind))
         if kind == "weight" and act is not None:
             act_name = name[: match.start("kind")] + act.name
             if act_name in weight_map:
-                wanted[act_name] = (bank_layer, int(match.group("expert")), spec.proj_to_role[proj] + "_input")
-    experts = (_num_moe_layers(config) if keep is None else len(keep)) * config.num_experts
+                wanted[act_name] = (bank_layer, row, spec.proj_to_role[proj] + "_input")
+    experts = (_num_moe_layers(config) if keep is None else len(keep)) * owned
     acts = [name for name, (_, _, role) in wanted.items() if role.endswith("_input")]
     # a partial set serves no W4A4 kernel; the pieces then carry none
     if len(acts) != experts * 3:

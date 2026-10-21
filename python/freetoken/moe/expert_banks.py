@@ -102,7 +102,12 @@ def build_expert_banks(
 
     kernel = method.kernel
     layout = method.layout()
-    E = method.cfg.num_experts
+    # method.cfg.num_experts stays the router's global count. The bank is the owned
+    # rows plus one zero pad, so a global id used as a row fails the range check below.
+    from freetoken.moe.expert_parallel import bank_geometry
+
+    fill, rows = bank_geometry(method.cfg.num_experts)
+    E = rows
     ids = list(range(num_layers)) if layers is None else sorted(layers)
     filled = set(ids)
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
@@ -121,12 +126,23 @@ def build_expert_banks(
     def _sources() -> dict[str, list]:
         return {role: [per_layer.get(l) for l in range(num_layers)] for role, per_layer in banks.items()}
 
+    def _zero_pad() -> None:
+        if rows == fill:
+            return
+        for per_layer in banks.values():
+            for tensor in per_layer.values():
+                tensor[fill:].zero_()
+        for alpha in alphas.values():
+            for layer in ids:
+                alpha[layer * rows + fill : (layer + 1) * rows].fill_(1)
+
     if dummy:
         for role, per_layer in banks.items():
             for tensor in per_layer.values():
                 _dummy_fill(role, tensor)
         for alpha in alphas.values():
             alpha.fill_(1.0)
+        _zero_pad()
         if hb is not None and torch.cuda.is_available():
             pin_banks(hb)
         return ExpertBanks(
@@ -136,12 +152,15 @@ def build_expert_banks(
         )
 
     def _fill(sink) -> None:
-        tracker = LayerCompletionTracker(E, hb, sink) if sink is not None else None
+        tracker = LayerCompletionTracker(fill, hb, sink) if sink is not None else None
         # a reader that skips a layer or mislabels a piece must fail here, not serve uninitialized rows
-        written = torch.zeros(num_layers, E, dtype=torch.int32)
+        written = torch.zeros(num_layers, fill, dtype=torch.int32)
         for layer_id, e0, e1, piece in pieces:
-            if not (0 <= layer_id < num_layers and 0 <= e0 < e1 <= E):
-                raise ValueError(f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} of {num_layers} x {E}")
+            if not (0 <= layer_id < num_layers and 0 <= e0 < e1 <= fill):
+                raise ValueError(
+                    f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} "
+                    f"of {num_layers} x {fill} owned rows"
+                )
             if layer_id not in filled:
                 continue
             # refuse before writing: a duplicate row would also complete the layer early and hand the sink a half-filled bank
@@ -160,6 +179,7 @@ def build_expert_banks(
             missing = [[ids[l], e] for l, e in missing]
             raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
 
+    _zero_pad()
     if layer_sink is not None:
         _fill(layer_sink)
     elif torch.cuda.is_available() and not resident:
@@ -203,10 +223,13 @@ def merge_expert_banks(parts: list[ExpertBanks], layer_methods, num_experts: int
                 if tensor is not None:
                     assert merged[layer] is None, (role, layer)
                     merged[layer] = tensor
+    from freetoken.moe.expert_parallel import bank_geometry
+
+    _, rows = bank_geometry(num_experts)
     for per_layer in sources.values():
         for layer, tensor in enumerate(per_layer):
             if tensor is None:
-                per_layer[layer] = placeholder_bank(num_experts)
+                per_layer[layer] = placeholder_bank(rows)
     formats = [legacy_format_for(m.kind, m.kernel.name) for m in layer_methods]
     primary = parts[0]
     return ExpertBanks(
@@ -294,7 +317,10 @@ def ftw_bank_bytes(model_path: str) -> int | None:
 
 
 def _method_expert_bytes(method) -> int:
-    return method.cfg.num_experts * sum(
+    from freetoken.moe.expert_parallel import bank_geometry
+
+    _, rows = bank_geometry(method.cfg.num_experts)
+    return rows * sum(
         math.prod(spec.shape) * torch.empty((), dtype=spec.dtype).element_size()
         for spec in method.layout().values() if not spec.resident
     )
@@ -377,6 +403,13 @@ def load_expert_banks(
     if resident:
         assert method is not None and layer_sink is None and layer_residency is None
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        from freetoken.distributed import get_ep_info
+
+        if get_ep_info().size > 1:
+            raise ValueError(
+                "expert parallelism cannot load FTW expert banks: they are packed for the full "
+                "expert count. Serve the original checkpoint."
+            )
         if resident:
             banks = load_ftw_banks_to_device(model_path, num_layers=model_config.num_moe_layers, device=device, workers=workers, chunk=chunk)
         else:
@@ -422,7 +455,11 @@ def load_expert_banks(
         if mixed:
             return _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, par, workers, chunk, layer_sink)
         if method is not None and method.kind is QuantKind.GGUF:
+            from freetoken.distributed import get_ep_info
             from freetoken.models.gguf.experts import load_gguf_expert_banks
+
+            if get_ep_info().size > 1:
+                raise ValueError("expert parallelism does not support GGUF expert banks")
 
             # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout
             return load_gguf_expert_banks(model_path, model_config.num_moe_layers, first_layer=model_config.first_k_dense_replace, dummy=dummy, device=device if resident else None)
