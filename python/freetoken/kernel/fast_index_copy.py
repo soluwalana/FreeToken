@@ -127,16 +127,22 @@ def fast_index_copy_jit(
         worker_feature_size=worker_feature_size,
         num_block=num_block,
     )
-    if priority is None:
-        module.launch(dst, dst_indices, src, src_indices, num_indices)
-        return
+    # The FFI launch reads TVMFFIEnvGetStream, which stays the legacy NULL stream
+    # unless this context publishes torch's current stream. The engine forward
+    # runs on its own stream; a NULL-stream copy is invisible to that stream's sync.
+    import tvm_ffi
 
-    assert priority in ("high", "normal")
-    assert sync_flag is not None
-    if priority == "high":
-        module.launch_high(dst, dst_indices, src, src_indices, num_indices, sync_flag)
-        return
-    module.launch_normal(dst, dst_indices, src, src_indices, num_indices, sync_flag)
+    with tvm_ffi.use_torch_stream():
+        if priority is None:
+            module.launch(dst, dst_indices, src, src_indices, num_indices)
+            return
+
+        assert priority in ("high", "normal")
+        assert sync_flag is not None
+        if priority == "high":
+            module.launch_high(dst, dst_indices, src, src_indices, num_indices, sync_flag)
+            return
+        module.launch_normal(dst, dst_indices, src, src_indices, num_indices, sync_flag)
 
 
 @lru_cache(maxsize=None)
@@ -203,7 +209,12 @@ def fast_index_copy_multi_jit(
     module = _jit_fast_index_copy_multi_module(
         num_threads=num_threads, blocks_per_bank=blocks_per_bank
     )
-    module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices, wait_flag)
+    # See fast_index_copy_jit: publish torch's current stream or this launch
+    # lands on the legacy NULL stream and outruns current_stream().synchronize().
+    import tvm_ffi
+
+    with tvm_ffi.use_torch_stream():
+        module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices, wait_flag)
 
 
 def update_copy_flag_jit(sync_flag: torch.Tensor, delta: int) -> None:

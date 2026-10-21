@@ -46,7 +46,12 @@ class PyNCCLDistributedImpl(DistributedImpl):
     comm: PyNCCLCommunicator
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        self.comm.all_reduce(x, "sum")
+        import tvm_ffi
+
+        # ncclAllReduce is queued on TVMFFIEnvGetStream. Without this, that is the
+        # legacy NULL stream, not the engine stream the forward is running on.
+        with tvm_ffi.use_torch_stream():
+            self.comm.all_reduce(x, "sum")
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
@@ -56,7 +61,10 @@ class PyNCCLDistributedImpl(DistributedImpl):
         output_shape = list(x.shape)
         output_shape[0] *= world_size
         result = x.new_empty(output_shape)
-        self.comm.all_gather(result, x)
+        import tvm_ffi
+
+        with tvm_ffi.use_torch_stream():
+            self.comm.all_gather(result, x)
         return result
 
 

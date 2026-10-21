@@ -11,6 +11,7 @@
 
 #include <bit>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -101,6 +102,15 @@ public:
     const auto data_ptr = t.data_ptr();
     const auto reduce_op = kNCCLReduceOPMap.at(op);
     const auto stream = LaunchKernel::resolve_device(t.device());
+    std::fprintf(stderr,
+                 "[pynccl] rank=%d ndim=%d count=%zu bytes=%zu max=%zu stream=%p sym=%d\n",
+                 m_rank, t.ndim(), size_dim, size_bytes, m_max_bytes,
+                 static_cast<void *>(stream), size_bytes <= m_max_bytes ? 1 : 0);
+    for (int i = 0; i < t.ndim(); ++i) {
+      std::fprintf(stderr, "[pynccl] rank=%d dim%d=%lld\n", m_rank, i,
+                   static_cast<long long>(t.size(i)));
+    }
+    std::fflush(stderr);
 
     if (size_bytes <= m_max_bytes) { // use internal buffer
       const auto buf_ptr = m_sym_mem.get();

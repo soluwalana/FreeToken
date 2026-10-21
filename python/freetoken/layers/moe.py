@@ -230,7 +230,17 @@ class OffloadMoELayer(MoELayer):
 
         comm = get_ep_comm()
         if comm.size > 1:
-            return comm.all_reduce(hidden_states)
+            if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+                print(
+                    f"[moe-disk] allreduce bytes={hidden_states.numel() * hidden_states.element_size()}",
+                    flush=True,
+                )
+            out = comm.all_reduce(hidden_states)
+            if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+                print("[moe-disk] allreduce launched", flush=True)
+                torch.cuda.synchronize()
+                print("[moe-disk] allreduce synced", flush=True)
+            return out
         return self._maybe_all_reduce(hidden_states)
 
     def _mask_ep(self, topk_weights: torch.Tensor, topk_ids: torch.Tensor):
@@ -393,8 +403,20 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
+        if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+            print(
+                f"[moe-disk] prefill layer={self.layer_id} M={hidden_states.shape[0]}",
+                flush=True,
+            )
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
+        if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+            view0 = cache.stage_views(self.layer_id, 0)[0]
+            print(
+                f"[moe-disk] gemm layer={self.layer_id} view={tuple(view0.shape)} "
+                f"dev={view0.device} ptr={view0.data_ptr()}",
+                flush=True,
+            )
         out = self._expert_gemm(
             cache,
             hidden_states,
@@ -405,6 +427,10 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+        if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+            print(f"[moe-disk] gemm launched layer={self.layer_id}", flush=True)
+            torch.cuda.synchronize()
+            print(f"[moe-disk] gemm synced layer={self.layer_id}", flush=True)
         cache.release_prefill_layer(self.layer_id)
         return out
 

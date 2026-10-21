@@ -192,11 +192,18 @@ class DiskExpertStore:
 
     def stage(self, cache) -> None:
         """Fill ``bounce[row]`` for each id in ``cache.src_indices``. A GPU hit is not in that list."""
+        layer = int(cache._pending_src_layer)
+        if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+            print(f"[moe-disk] stage.item layer={layer}", flush=True)
         n = int(cache.num_indices.item())
+        if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+            print(f"[moe-disk] stage n={n} layer={layer}", flush=True)
         if n <= 0:
             return
         rows = cache.src_indices[:n].detach().to(dtype=torch.int64, device="cpu").tolist()
-        self.stage_rows(int(cache._pending_src_layer), rows, pad=cache.ep_pad)
+        self.stage_rows(layer, rows, pad=cache.ep_pad)
+        if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+            print(f"[moe-disk] stage filled layer={layer} rows={len(rows)}", flush=True)
 
     def stage_rows(self, layer: int, rows: list[int], *, pad: int | None) -> None:
         for row in rows:

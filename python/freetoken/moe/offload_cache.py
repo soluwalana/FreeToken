@@ -1325,6 +1325,12 @@ class OffloadMoeCache:
             # bank). evict_slots/src_indices/num_indices are shared across banks;
             # src_indices holds layer-local expert rows, resolved against this layer's
             # source pointers (layer_id is a static int per captured graph node).
+            if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+                print(
+                    f"[moe-disk] copy launch layer={layer_id} whole={whole} "
+                    f"stream={torch.cuda.current_stream(self.device).cuda_stream}",
+                    flush=True,
+                )
             fast_index_copy_multi_jit(
                 self._copy_dst_ptrs if whole else self._copy_dst_ptrs_pool[self.pool_of_layer[layer_id]],
                 self._copy_src_ptrs[layer_id],
@@ -1335,6 +1341,8 @@ class OffloadMoeCache:
                 blocks_per_bank=self._copy_blocks_per_bank,
             )
             self._sync_disk_bounce()
+            if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
+                print(f"[moe-disk] copy done layer={layer_id}", flush=True)
             return
 
         from freetoken.kernel import fast_index_copy_jit
