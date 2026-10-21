@@ -4,7 +4,10 @@ The GPU slot cache still decides which rows live on the device. Its host source 
 pinned bounce, aliased as every layer, so the existing copy plan and slot ids stay valid.
 A pinned window in front of the checkpoint holds rows the GPU has evicted but a later
 token still wants. A miss that is also absent from that window is read from the safetensors
-shard and packed with the block-fp8 kernel. The pad row stays zero and is never stored.
+shard and packed into the kernel's native rows. Block-fp8 and NVFP4 (``triton``
+and ``w4a4``) are the formats this reader knows. The pad row stays zero and is
+never stored. NVFP4 rows stay packed; the inline-dequant GEMM is a kernel choice,
+not a second copy in the window.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from dataclasses import dataclass
 
 import torch
 
+from freetoken.layers.quantization import QuantKind
 from freetoken.moe.expert_banks import ExpertBanks
 from freetoken.moe.expert_parallel import bank_geometry, is_rank0, remap_expert
 from freetoken.moe.legacy_format import legacy_format_for
@@ -26,14 +30,29 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
-# GLM-5.3 routed experts. The bank layer is the checkpoint layer minus the leading dense layers.
-_EXPERT_KEY = re.compile(
-    r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)$"
+# Kernels whose banks are the checkpoint rows. Marlin and b12x retile inside pack.
+DISK_NVFP4_KERNELS = ("triton", "w4a4")
+# A disk prefill that already touches this much of the owned rows keeps the sequential read.
+_WHOLE_LAYER_NUMERATOR = 9
+_WHOLE_LAYER_DENOMINATOR = 10
+
+# Routed experts. GLM-5.3 stores them at model.layers; GLM-5.3-Flash at
+# model.language_model.layers. The bank layer is the checkpoint layer minus the leading dense layers.
+_LAYER_EXPERT = r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+_FP8_KEY = re.compile(
+    _LAYER_EXPERT + r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)$"
+)
+_NVFP4_KEY = re.compile(
+    _LAYER_EXPERT + r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight_scale_2|weight_scale|weight)$"
+)
+_INPUT_KEY = re.compile(
+    _LAYER_EXPERT + r"(?P<proj>gate|up|down)_proj\.input_scale$"
 )
 _PROJECTIONS = ("gate", "up", "down")
-_KIND_SUFFIX = {"weight": "", "weight_scale_inv": "_scale"}
-_PIECES = 6
+_FP8_SUFFIX = {"weight": "", "weight_scale_inv": "_scale"}
+_NVFP4_SUFFIX = {"weight": "", "weight_scale": "_scale", "weight_scale_2": "_global"}
+_FP8_PIECES = 6
+_NVFP4_PIECES = 9
 
 _SAFETENSORS_DTYPE = {
     "BOOL": torch.bool,
@@ -72,19 +91,57 @@ def packed_row_bytes(layout) -> int:
     return total
 
 
-def build_expert_index(folder: str, model_config, *, rank: int, size: int) -> dict[tuple[int, int, str], TensorLoc]:
+def _key_spec(kind: QuantKind) -> tuple[re.Pattern[str], dict[str, str], int, str]:
+    if kind is QuantKind.NVFP4:
+        return (
+            _NVFP4_KEY,
+            _NVFP4_SUFFIX,
+            _NVFP4_PIECES,
+            "{weight,weight_scale,weight_scale_2}",
+        )
+    if kind is QuantKind.FP8_BLOCK:
+        return _FP8_KEY, _FP8_SUFFIX, _FP8_PIECES, "{weight,weight_scale_inv}"
+    raise ValueError(f"--moe-disk has no expert index for {kind}")
+
+
+def build_expert_index(
+    folder: str,
+    model_config,
+    *,
+    rank: int,
+    size: int,
+    kind: QuantKind = QuantKind.FP8_BLOCK,
+) -> dict[tuple[int, int, str], TensorLoc]:
     """``(bank layer, local row, role) -> payload location`` for the experts this rank owns.
 
     Reads shard headers only. Unowned expert ids are left out, and so is the pad row.
     """
+    index, _inputs = _scan_expert_index(folder, model_config, rank=rank, size=size, kind=kind)
+    return index
+
+
+def _scan_expert_index(
+    folder: str,
+    model_config,
+    *,
+    rank: int,
+    size: int,
+    kind: QuantKind,
+) -> tuple[dict[tuple[int, int, str], TensorLoc], dict[tuple[int, int, str], TensorLoc]]:
     from freetoken.models.loader import safetensors_weight_map
 
+    pattern, suffixes, pieces, names = _key_spec(kind)
     first_k = int(getattr(model_config, "first_k_dense_replace", 0) or 0)
     num_moe_layers = model_config.num_moe_layers
     owned, _rows = bank_geometry(model_config.num_experts, size)
-    wanted: dict[str, list[tuple[str, int, int, str]]] = {}
+    # (name, bank, row, role, side). side is the activation-scale map, which is not a host-window row.
+    wanted: dict[str, list[tuple[str, int, int, str, bool]]] = {}
     for name, shard in safetensors_weight_map(folder).items():
-        match = _EXPERT_KEY.match(name)
+        match = pattern.match(name)
+        side = False
+        if match is None and kind is QuantKind.NVFP4:
+            match = _INPUT_KEY.match(name)
+            side = match is not None
         if match is None:
             continue
         bank = int(match["layer"]) - first_k
@@ -93,14 +150,18 @@ def build_expert_index(folder: str, model_config, *, rank: int, size: int) -> di
         row = remap_expert(int(match["expert"]), rank=rank, size=size)
         if row is None:
             continue
-        role = match["proj"] + _KIND_SUFFIX[match["kind"]]
-        wanted.setdefault(shard, []).append((name, bank, row, role))
+        if side:
+            role = match["proj"] + "_input"
+        else:
+            role = match["proj"] + suffixes[match["kind"]]
+        wanted.setdefault(shard, []).append((name, bank, row, role, side))
 
     index: dict[tuple[int, int, str], TensorLoc] = {}
+    inputs: dict[tuple[int, int, str], TensorLoc] = {}
     for shard, items in wanted.items():
         path = os.path.join(folder, shard)
         data_base, header = _shard_header(path)
-        for name, bank, row, role in items:
+        for name, bank, row, role, side in items:
             meta = header.get(name)
             if meta is None:
                 raise ValueError(f"{path} is listed as holding {name}, but the shard header has no such tensor")
@@ -114,19 +175,38 @@ def build_expert_index(folder: str, model_config, *, rank: int, size: int) -> di
             if nbytes != expect:
                 raise ValueError(f"{name} header length {nbytes} does not match shape {shape} {dtype}")
             key = (bank, row, role)
-            if key in index:
+            dest = inputs if side else index
+            if key in dest:
                 raise ValueError(f"duplicate expert tensor for layer {bank} row {row} role {role}: {name}")
-            index[key] = TensorLoc(path, data_base + int(start), nbytes, shape, dtype)
+            dest[key] = TensorLoc(path, data_base + int(start), nbytes, shape, dtype)
 
-    expected = num_moe_layers * owned * _PIECES
+    expected = num_moe_layers * owned * pieces
     if len(index) != expected:
         raise ValueError(
             f"--moe-disk indexed {len(index)} expert tensors, expected {expected} "
-            f"({num_moe_layers} layers x {owned} owned experts x {_PIECES}). "
+            f"({num_moe_layers} layers x {owned} owned experts x {pieces}). "
             "The reader looks for model.layers.{L}.mlp.experts.{E}.{gate,up,down}_proj."
-            "{weight,weight_scale_inv}."
+            f"{names}, or the same key under model.language_model.layers."
         )
-    return index
+    return index, inputs
+
+
+def routed_prefill_rows(topk_ids, *, num_experts: int, pad: int | None) -> list[int] | None:
+    """Unique owned local rows for a disk prefill.
+
+    ``None`` means the set covers at least 90% of the owned rows, so the caller
+    keeps the sequential whole-layer read. The pad and any id outside the owned
+    rows are dropped.
+    """
+    owned = num_experts - 1 if pad is not None else num_experts
+    if isinstance(topk_ids, torch.Tensor):
+        flat = topk_ids.detach().reshape(-1).to(dtype=torch.int64, device="cpu").tolist()
+    else:
+        flat = list(topk_ids)
+    rows = sorted({int(i) for i in flat if 0 <= int(i) < owned})
+    if owned > 0 and len(rows) * _WHOLE_LAYER_DENOMINATOR >= owned * _WHOLE_LAYER_NUMERATOR:
+        return None
+    return rows
 
 
 class HostExpertWindow:
@@ -171,10 +251,24 @@ class HostExpertWindow:
 class DiskExpertStore:
     """Host window plus the one-layer bounce ``copy_missing`` DMAs from."""
 
-    def __init__(self, index, method, *, rows: int, capacity: int, pin: bool):
+    def __init__(
+        self,
+        index,
+        method,
+        *,
+        rows: int,
+        capacity: int,
+        pin: bool,
+        inputs=None,
+        gate_up_alpha: torch.Tensor | None = None,
+        down_alpha: torch.Tensor | None = None,
+    ):
         self.index = index
+        self.inputs = inputs or {}
         self.method = method
         self.rows = rows
+        self.gate_up_alpha = gate_up_alpha
+        self.down_alpha = down_alpha
         self.window = HostExpertWindow(method.layout(), capacity, pin=pin)
         self.bounce = {
             role: _alloc((rows, *spec.shape), spec.dtype, pin=pin)
@@ -220,6 +314,9 @@ class DiskExpertStore:
                 bank[row].copy_(self.window.slots[role][slot])
 
     def _load(self, layer: int, row: int, slot: int) -> None:
+        if self.method.kind is QuantKind.NVFP4:
+            self._load_nvfp4(layer, row, slot)
+            return
         piece = {}
         for proj in _PROJECTIONS:
             weight = self._read(self._loc(layer, row, proj))
@@ -228,6 +325,33 @@ class DiskExpertStore:
             piece[proj + "_scale"] = scale.to(torch.bfloat16).unsqueeze(0)
         out = {role: tensor[slot : slot + 1] for role, tensor in self.window.slots.items()}
         self.method.pack(piece, out)
+
+    def _load_nvfp4(self, layer: int, row: int, slot: int) -> None:
+        """Pack checkpoint rows. Scales stay fp8. Activation scales are not window rows."""
+        want_input = self.method.kernel.name == "w4a4"
+        piece = {}
+        for proj in _PROJECTIONS:
+            piece[proj] = self._read(self._loc(layer, row, proj)).unsqueeze(0)
+            piece[proj + "_scale"] = self._read(self._loc(layer, row, proj + "_scale")).unsqueeze(0)
+            piece[proj + "_global"] = self._read(self._loc(layer, row, proj + "_global")).reshape(1, -1)
+            if want_input:
+                piece[proj + "_input"] = self._read(self._input_loc(layer, row, proj)).reshape(1, -1)
+        out = {role: tensor[slot : slot + 1] for role, tensor in self.window.slots.items()}
+        got = self.method.pack(piece, out)
+        if not got or self.gate_up_alpha is None:
+            return
+        at = layer * self.rows + row
+        self.gate_up_alpha[at] = got["gate_up_alpha"].reshape(-1)[0]
+        self.down_alpha[at] = got["down_alpha"].reshape(-1)[0]
+
+    def _input_loc(self, layer: int, row: int, proj: str) -> TensorLoc:
+        try:
+            return self.inputs[(layer, row, proj + "_input")]
+        except KeyError:
+            raise KeyError(
+                f"no input_scale for MoE layer {layer} local expert {row} {proj}_proj; "
+                "w4a4 needs the checkpoint's static activation scales"
+            ) from None
 
     def _loc(self, layer: int, row: int, role: str) -> TensorLoc:
         try:
@@ -259,7 +383,7 @@ def open_disk_experts(config, method, *, pin: bool = True) -> tuple[DiskExpertSt
     """Index this rank's experts and allocate the bounce that stands in for every layer's banks."""
     model = config.model_config
     info = config.ep_info
-    index = build_expert_index(config.model_path, model, rank=info.rank, size=info.size)
+    index, inputs = _scan_expert_index(config.model_path, model, rank=info.rank, size=info.size, kind=method.kind)
     owned, rows = bank_geometry(model.num_experts, info.size)
     layout = method.layout()
     per = packed_row_bytes(layout)
@@ -269,11 +393,17 @@ def open_disk_experts(config, method, *, pin: bool = True) -> tuple[DiskExpertSt
             f"--moe-disk-cache-gb {config.moe_disk_cache_gb:g} is smaller than one packed expert ({per} bytes)"
         )
     capacity = budget // per
-    store = DiskExpertStore(index, method, rows=rows, capacity=capacity, pin=pin)
+    gate_up_alpha, down_alpha = _resident_alphas(layout, model.num_moe_layers, rows)
+    store = DiskExpertStore(
+        index, method, rows=rows, capacity=capacity, pin=pin, inputs=inputs,
+        gate_up_alpha=gate_up_alpha, down_alpha=down_alpha,
+    )
     sources = {role: [tensor] * model.num_moe_layers for role, tensor in store.bounce.items()}
     banks = ExpertBanks(
         quant_format=legacy_format_for(method.kind, method.kernel.name),
         sources=sources,
+        gate_up_alpha=gate_up_alpha,
+        down_alpha=down_alpha,
         kind=method.kind,
         kernel=method.kernel.name,
         layout=layout,
@@ -285,6 +415,21 @@ def open_disk_experts(config, method, *, pin: bool = True) -> tuple[DiskExpertSt
             f"bounce {rows * per / 2**30:.2f} GiB"
         )
     return store, banks
+
+
+def _resident_alphas(layout, layers: int, rows: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Per-expert activation scales for a native W4A4 kernel. Triton keeps none.
+
+    Allocated on the current CUDA device when there is one, so ``set_alphas`` keeps
+    this tensor and a later disk pack writes the scale the GEMM reads.
+    """
+    if "gate_up_alpha" not in layout:
+        return None, None
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    n = layers * rows
+    gate = torch.ones(n, dtype=layout["gate_up_alpha"].dtype, device=device)
+    down = torch.ones(n, dtype=layout["down_alpha"].dtype, device=device)
+    return gate, down
 
 
 def _shard_header(path: str) -> tuple[int, dict]:

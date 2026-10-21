@@ -1154,6 +1154,51 @@ class OffloadMoeCache:
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
 
+    def plan_routed_prefill(self, layer_id: int, rows: list[int]) -> None:
+        """Copy plan for a disk prefill of ``rows`` only.
+
+        Destination position is the expert id, same as ``materialize_layer``, but the
+        slot map is left alone. ``materialize_layer`` rewrites every expert into slots
+        0..E-1 and drops the rest of the GPU cache.
+        """
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = True
+        n = len(rows)
+        if n:
+            ids = torch.tensor(rows, dtype=self.src_indices.dtype, device=self.device)
+            self.src_indices[:n].copy_(ids)
+            self.evict_slots[:n].copy_(ids)
+            self._install_routed_slots(layer_id, rows)
+        self.num_indices.fill_(n)
+
+    def _install_routed_slots(self, layer_id: int, rows: list[int]) -> None:
+        """Record that staging positions ``rows`` now hold this layer's experts.
+
+        The prefill buffer is the front of the slot cache, so those writes replace
+        whoever lived there. Slots this prefill does not touch keep their residents.
+        ``materialize_layer`` instead claims every local row and drops the rest.
+        """
+        slots = torch.tensor(rows, dtype=torch.int64, device=self.device)
+        flat = layer_id * self.num_experts + slots
+        slot_for = self.slot_for_id.view(-1)
+        id_of = self.id_of_slot
+        dest = torch.zeros(self.cache_size, dtype=torch.bool, device=self.device)
+        dest[slots] = True
+        prev = slot_for[flat].to(torch.int64)
+        leave = (prev >= 0) & ~dest[prev.clamp(min=0)]
+        id_of[prev[leave]] = -1
+        self.usage[prev[leave]] = 0
+        old = id_of[slots].to(torch.int64)
+        drop = (old >= 0) & (old != flat)
+        slot_for[old[drop]] = -1
+        id_of[slots] = flat.to(id_of.dtype)
+        slot_for[flat] = slots.to(slot_for.dtype)
+        self.step += 1
+        self.usage[slots] = self.step
+        self._pin_ep_pad()
+        if self.ep_pad is not None:
+            self.id_of_slot[self.ep_pad] = layer_id * self.num_experts + self.ep_pad
+
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 

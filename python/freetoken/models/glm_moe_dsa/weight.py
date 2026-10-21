@@ -58,11 +58,57 @@ class _ShardReader:
         self._handles.clear()
 
 
+def _projection_scheme(name: str):
+    """The installed quant config's scheme for ``name``, or None when weights load without one."""
+    from freetoken.layers.quantization import get_quant_config
+
+    try:
+        quant = get_quant_config()
+    except RuntimeError:
+        return None
+    if quant is None:
+        return None
+    return quant.scheme_for_name(name)
+
+
+def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
+    """Per-tensor scalar or per-channel scale -> fp32 ``[rows]``."""
+    flat = scale.reshape(-1).to(torch.float32)
+    if flat.numel() == 1:
+        return flat.expand(rows).contiguous()
+    if flat.numel() != rows:
+        raise ValueError(
+            f"fp8 weight_scale has {flat.numel()} elements for a weight with {rows} output rows "
+            f"(shape {tuple(scale.shape)}); expected 1 or {rows}"
+        )
+    return flat.contiguous()
+
+
 def _proj(reader, src: str, dst: str, *, bf16: bool = False) -> Iterator[tuple[str, torch.Tensor]]:
-    """One projection as the module stores it. ``bf16`` dequantizes a block-fp8 checkpoint tensor."""
+    """One projection as the module stores it.
+
+    A bf16 checkpoint tensor stays bf16. Per-tensor FP8 (``weight_scale`` and, when the
+    shard has it, ``input_scale``) is yielded for an ``FP8_TENSOR`` scheme, which Ada's
+    fp8 tensor cores can run. Block-fp8 stays ``weight`` + ``weight_scale_inv``. ``bf16``
+    dequantizes either fp8 form for modules the architecture serves unquantized.
+    """
     w = reader.get(f"{src}.weight")
     if w.dtype != torch.float8_e4m3fn:
         yield f"{dst}.weight", w.to(torch.bfloat16)
+        return
+    scheme = _projection_scheme(src)
+    if scheme is not None and scheme.kind is QuantKind.FP8_TENSOR:
+        scale = _per_row_scale(reader.get(f"{src}.weight_scale"), w.shape[0])
+        if bf16:
+            yield f"{dst}.weight", (w.to(torch.float32) * scale[:, None]).to(torch.bfloat16)
+            return
+        yield f"{dst}.weight", w
+        yield f"{dst}.weight_scale", scale
+        if scheme.has("input_scale"):
+            key = f"{src}.input_scale"
+            if not reader.has(key):
+                raise KeyError(f"{src} is per-tensor FP8 with an activation scale, but the checkpoint has no {key}")
+            yield f"{dst}.input_scale", reader.get(key).reshape(()).to(torch.float32)
         return
     scale = reader.get(f"{src}.weight_scale_inv")
     if not bf16:

@@ -5,11 +5,14 @@ NVFP4 exports (ModelOpt tensor kinds from LibertAIDAI, compressed-tensors kinds 
 RedHatAI, selected by ``quantization_config``) and the zai-org block-fp8 release. Not
 supported: text-only key layouts, TP > 1, resident routed experts.
 
-Routed experts go to the offload cache from their NVFP4 or block-fp8 pieces; every
-other projection loads as stored (bf16, or fp8 codes with their block scales) with keys
-renamed ``model.language_model.X`` -> ``model.X``. The vision tower loads as stored under
-``model.visual.X`` -> ``visual.X`` when an encoder is built; the trailing MTP layer is
-never read.
+Routed experts go to the offload cache from their NVFP4 or block-fp8 pieces. A dense
+projection the quant config marks NVFP4 (the leading MLPs on nvidia/GLM-5.3-Flash-NVFP4)
+is yielded as the NVFP4 linear's buffers: packed ``weight``, fp8 ``weight_scale``,
+per-row ``weight_global`` from the scalar ``weight_scale_2``, and ``input_scale`` when
+the scheme has one. Every other projection loads as stored (bf16, or fp8 codes with
+their block scales) with keys renamed ``model.language_model.X`` -> ``model.X``. The
+vision tower loads as stored under ``model.visual.X`` -> ``visual.X`` when an encoder
+is built; the trailing MTP layer is never read.
 
 Load-time fusions (must mirror the module split orders):
 
@@ -101,9 +104,64 @@ _FP8_EXPERT_RE = re.compile(
 )
 
 
+def _projection_scheme(name: str):
+    """Scheme of the module ``name``. ``scheme_for`` applies the language_model root."""
+    from freetoken.layers.quantization import get_quant_config
+
+    try:
+        quant = get_quant_config()
+    except RuntimeError:
+        return None
+    if quant is None:
+        return None
+    return quant.scheme_for(name)
+
+
+def _nvfp4_global(scale: torch.Tensor, rows: int) -> torch.Tensor:
+    """Per-tensor ``weight_scale_2`` -> fp32 ``[rows]``, the shape the NVFP4 linear stores."""
+    flat = scale.reshape(-1).to(torch.float32)
+    if flat.numel() == 1:
+        return flat.expand(rows).contiguous()
+    if flat.numel() != rows:
+        raise ValueError(
+            f"weight_scale_2 has {flat.numel()} elements for a weight with {rows} output rows "
+            f"(shape {tuple(scale.shape)}); expected 1 or {rows}"
+        )
+    return flat.contiguous()
+
+
+def _iter_nvfp4_linear(reader, src: str, dst: str, weight: torch.Tensor, scheme):
+    """Packed NVFP4 buffers for one dense linear. Scales stay in the checkpoint dtypes."""
+    if weight.dtype is not torch.uint8:
+        raise ValueError(f"{src}.weight is {weight.dtype}, expected packed uint8 for an NVFP4 module")
+    scale = reader.get(f"{src}.weight_scale")
+    if scale.dtype is not torch.float8_e4m3fn:
+        raise ValueError(f"{src}.weight_scale is {scale.dtype}, expected float8_e4m3fn")
+    yield f"{dst}.weight", weight
+    yield f"{dst}.weight_scale", scale
+    yield f"{dst}.weight_global", _nvfp4_global(reader.get(f"{src}.weight_scale_2"), weight.shape[0])
+    if scheme.has("input_scale"):
+        key = f"{src}.input_scale"
+        if not reader.has(key):
+            raise KeyError(f"{src} is NVFP4 with an activation scale, but the checkpoint has no {key}")
+        yield f"{dst}.input_scale", reader.get(key).reshape(()).to(torch.float32)
+
+
 def _proj(reader, src: str, dst: str) -> Iterator[tuple[str, torch.Tensor]]:
-    """One projection as the checkpoint stores it: bf16, or fp8 codes with their block scales."""
+    """One projection as the module stores it.
+
+    NVFP4 (packed uint8 weight, fp8 block scale, per-row global, optional activation
+    scale) is yielded when the quant config says so. Otherwise the tensor is bf16, or
+    fp8 codes with their block scales. A packed uint8 weight on any other module is an
+    error: casting those bytes to bf16 would not recover the projection.
+    """
     w = reader.get(f"{src}.weight")
+    scheme = _projection_scheme(dst)
+    if scheme is not None and scheme.kind is QuantKind.NVFP4:
+        yield from _iter_nvfp4_linear(reader, src, dst, w, scheme)
+        return
+    if w.dtype is torch.uint8:
+        raise ValueError(f"{src}.weight is packed uint8 but {dst} is not an NVFP4 module")
     if w.dtype == torch.float8_e4m3fn:
         yield f"{dst}.weight", w
         yield f"{dst}.weight_scale_inv", reader.get(f"{src}.weight_scale_inv")

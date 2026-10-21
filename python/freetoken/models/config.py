@@ -13,8 +13,10 @@ def detect_expert_quant(hf_config: Any) -> str:
     a ModelOpt FP4 build (``quant_algo: NVFP4``) OR an llm-compressor NVFP4 export
     (``quant_method: compressed-tensors`` + ``format: nvfp4-pack-quantized``, or
     ``format: mixed-precision`` with an nvfp4 config group, e.g.
-    RedHatAI/GLM-5.3-Flash-NVFP4), else the lowercased algo string (``"none"`` when
-    unquantized). Models with mixed-precision configs (e.g. qwen3_5_moe) need their
+    RedHatAI/GLM-5.3-Flash-NVFP4), or ModelOpt ``quant_algo: MIXED_PRECISION`` whose
+    ``quantized_layers`` mark ``.mlp.experts`` as ``NVFP4`` / ``W4A16_NVFP4``.
+    Otherwise the lowercased algo string (``"none"`` when unquantized, ``"fp8"`` for
+    a plain FP8 checkpoint). Models with other mixed-precision configs need their
     own detector."""
     quant = getattr(hf_config, "quantization_config", None)
     if quant is None:
@@ -38,6 +40,17 @@ def detect_expert_quant(hf_config: Any) -> str:
         for g in expert_groups or groups:
             if "nvfp4" in str(g.get("format") or "").lower():
                 return "nvfp4"
+    # ModelOpt writes MIXED_PRECISION at the top and the real algo on each quantized_layers entry.
+    # A plain quant_algo FP8 stays "fp8" below: that string is what forces expert offload.
+    if str(algo).upper() == "MIXED_PRECISION":
+        layers = get("quantized_layers") or {}
+        if isinstance(layers, dict):
+            for key, spec in layers.items():
+                if not str(key).endswith(".mlp.experts"):
+                    continue
+                layer_algo = spec.get("quant_algo") if isinstance(spec, dict) else spec
+                if str(layer_algo or "").upper() in ("NVFP4", "W4A16_NVFP4"):
+                    return "nvfp4"
     return str(algo).lower()
 
 

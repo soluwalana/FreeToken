@@ -774,12 +774,22 @@ class Engine:
         if config.moe_disk:
             if layer_methods is not None:
                 raise ValueError("--moe-disk serves one expert format; this checkpoint has several")
-            if method is None or method.kind is not QuantKind.FP8_BLOCK:
+            from freetoken.moe.expert_disk import DISK_NVFP4_KERNELS, open_disk_experts
+
+            native_nvfp4 = (
+                method is not None
+                and method.kind is QuantKind.NVFP4
+                and method.kernel.name in DISK_NVFP4_KERNELS
+            )
+            if method is None or not (method.kind is QuantKind.FP8_BLOCK or native_nvfp4):
                 got = "none" if method is None else f"{method.kind} / {method.kernel.name}"
-                raise ValueError(f"--moe-disk serves block-fp8 experts (got {got})")
+                raise ValueError(
+                    "--moe-disk serves block-fp8 experts, or NVFP4 on the native-row kernels "
+                    f"triton and w4a4 (got {got}). Marlin and b12x retile each disk miss; "
+                    "pass --quant-backend moe.nvfp4=triton or --quant-backend moe.nvfp4=w4a4."
+                )
             if config.use_dummy_weight:
                 raise ValueError("--moe-disk reads expert rows from the checkpoint; it cannot be combined with --use-dummy-weight")
-            from freetoken.moe.expert_disk import open_disk_experts
 
             disk, banks = open_disk_experts(config, method)
             cpu_layer_ids = frozenset()

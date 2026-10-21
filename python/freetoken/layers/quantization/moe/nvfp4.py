@@ -47,6 +47,10 @@ class TritonNvfp4MoEKernel(MoEKernel):
         reason = gated_epilogue_reason(cfg)
         return f"triton nvfp4 MoE kernel: {reason}" if reason else None
 
+    def worth_it(self, cfg: MoEConfig) -> bool:
+        # Inline dequant. Native NVFP4 tensor cores start at sm_100; at or above that a native kernel wins.
+        return backend.device_capability() < (10, 0)
+
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         i, h = cfg.intermediate, cfg.hidden
         return {
@@ -94,6 +98,13 @@ class W4a4Nvfp4MoEKernel(TritonNvfp4MoEKernel):
             return "the experts declare no static activation scale (W4A16 checkpoint)"
         if cfg.apply_router_weight_on_input:
             return "the routing weight scales the input, which is quantized once per token"
+        cc = backend.device_capability()
+        if cc < (12, 0):
+            return f"w4a4 requires sm_120+, got sm_{cc[0]}{cc[1]}"
+        from freetoken.kernel import nvfp4_moe
+
+        if not torch.cuda.is_available() or not nvfp4_moe.w4a4_available(torch.cuda.current_device()):
+            return f"w4a4 NVFP4 GEMM is not available on sm_{cc[0]}{cc[1]}"
         return None
 
     def worth_it(self, cfg: MoEConfig) -> bool:

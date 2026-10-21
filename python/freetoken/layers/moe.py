@@ -408,7 +408,19 @@ class OffloadMoELayer(MoELayer):
                 f"[moe-disk] prefill layer={self.layer_id} M={hidden_states.shape[0]}",
                 flush=True,
             )
-        cache.materialize_layer(self.layer_id)
+        rows = None
+        if cache.disk is not None:
+            from freetoken.moe.expert_disk import routed_prefill_rows
+
+            rows = routed_prefill_rows(topk_ids, num_experts=cache.num_experts, pad=cache.ep_pad)
+        if rows is None:
+            cache.materialize_layer(self.layer_id)
+        else:
+            # Short list: H2D lands at position == expert id. The pad is never stored.
+            cache.plan_routed_prefill(self.layer_id, rows)
+            if cache.ep_pad is not None:
+                for view in cache.stage_views(self.layer_id, 0):
+                    view[cache.ep_pad].zero_()
         cache.copy_missing()
         if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
             view0 = cache.stage_views(self.layer_id, 0)[0]
