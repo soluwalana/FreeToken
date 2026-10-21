@@ -346,6 +346,8 @@ class OffloadMoeCache:
         self.prefill_total_rows = 0
         # Local expert row pinned into a zero slot when expert parallelism is on. None otherwise.
         self.ep_pad: int | None = None
+        # Set by the engine for --moe-disk. Fills the shared bounce before the H2D copy.
+        self.disk = None
         self._slice_pools()
 
     def _pool_layout(self, pool: int) -> int:
@@ -1293,10 +1295,15 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        # --moe-disk: src_indices are the GPU misses. Fill those bounce rows, then the
+        # existing H2D copies them. A row still in VRAM is absent from src_indices.
+        if self.disk is not None:
+            self.disk.stage(self)
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 if layer_id in self.locked_hybrid:
                     self.locked_fetch.copy(self, layer_id)
+                    self._sync_disk_bounce()
                     return
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
@@ -1307,6 +1314,7 @@ class OffloadMoeCache:
             # never CUDA-graph captured: prefill is not captured, and decode of an unpinned layer routes to the CPU executor or, locked_hybrid, to the staged fetch above
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, 0)):
                 view.copy_(per_layer[layer_id])
+            self._sync_disk_bounce()
             return
         # materialize stages rows of staging buffer 0; ensure stages slots local to the layer's pool
         whole = self._pending_whole_layer
@@ -1326,6 +1334,7 @@ class OffloadMoeCache:
                 self.num_indices,
                 blocks_per_bank=self._copy_blocks_per_bank,
             )
+            self._sync_disk_bounce()
             return
 
         from freetoken.kernel import fast_index_copy_jit
@@ -1341,6 +1350,13 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+        self._sync_disk_bounce()
+
+    def _sync_disk_bounce(self) -> None:
+        """The bounce is one buffer aliased across layers, so this layer's H2D must finish before the next fill."""
+        if self.disk is None:
+            return
+        torch.cuda.current_stream(self.device).synchronize()
 
 
 def _layers(n: int) -> str:

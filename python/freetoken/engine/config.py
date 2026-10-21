@@ -45,6 +45,11 @@ class EngineConfig:
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
     # low-memory reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
+    # --moe-disk: routed experts stay in the checkpoint. A pinned host window holds the
+    # hot rows; the GPU slot cache is what moves a row onto the device.
+    moe_disk: bool = False
+    # GiB of pinned host rows per rank in front of the checkpoint.
+    moe_disk_cache_gb: float = 48.0
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False

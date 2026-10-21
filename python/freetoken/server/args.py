@@ -727,6 +727,23 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--moe-disk",
+        action="store_true",
+        default=ServerArgs.moe_disk,
+        help=(
+            "Keep routed experts in the checkpoint and fetch the rows a step misses. "
+            "Requires --moe-strategy offload (or auto). Disables CUDA graphs and MoE "
+            "prefill overlap. --moe-disk-cache-gb sizes the pinned host window per rank."
+        ),
+    )
+    parser.add_argument(
+        "--moe-disk-cache-gb",
+        type=float,
+        default=ServerArgs.moe_disk_cache_gb,
+        help="Pinned host window for --moe-disk, in GiB per rank (default: 48).",
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",
@@ -942,6 +959,12 @@ def parse_args(
         )
     if ep_size > 1 and kwargs["moe_cpu_layers"]:
         parser.error("--moe-cpu-layers cannot be combined with --expert-parallel-size")
+    if kwargs["moe_disk"] and kwargs["moe_strategy"] in ("cpu", "hybrid", "fused"):
+        parser.error("--moe-disk requires --moe-strategy offload (or auto)")
+    if kwargs["moe_disk"] and kwargs["moe_cpu_layers"]:
+        parser.error("--moe-disk cannot be combined with --moe-cpu-layers")
+    if kwargs["moe_disk_cache_gb"] <= 0:
+        parser.error("--moe-disk-cache-gb must be positive")
     world = ep_size if ep_size > 1 else tp_size
     gpu_n = len(kwargs["gpu"])
     if gpu_n not in (0, world):
