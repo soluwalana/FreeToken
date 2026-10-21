@@ -393,13 +393,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         iter_weights="iter_gguf_weights",
         packed_modules_mapping=_EXPERTS_PACKED,
     ),
-    # GLM-5.2 (model_type glm_moe_dsa): DeepSeek-V3.2-class MLA + DSA sparse attention
-    # with GLM-4-style sigmoid/noaux_tc MoE routing; NVFP4 routed experts served from
-    # the offload cache.
+    # GLM-5.2 / GLM-5.3 (model_type glm_moe_dsa): DeepSeek-V3.2-class MLA + DSA sparse
+    # attention with GLM-4-style sigmoid/noaux_tc MoE routing. Routed experts (NVFP4 or
+    # block-fp8) are served from the offload cache. kv_b is absorbed as a bf16 bmm, so a
+    # block-fp8 checkpoint is dequantized when it is loaded.
     "GlmMoeDsaForCausalLM": ModelSpec(
         "freetoken.models.glm_moe_dsa",
         "GlmMoeDsaForCausalLM",
         packed_modules_mapping=_EXPERTS_PACKED,
+        unquantized_modules=("*.self_attn.kv_b_proj",),
     ),
     # GLM-5.3-Flash (model_type glm5_next): hybrid KDA linear attention (34/45 layers)
     # + NoPE-MLA/DSA with a kpool-compressed indexer (11/45), mHC x4 residual streams,

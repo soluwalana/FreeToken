@@ -62,9 +62,19 @@ class Fp8BlockLinearMethod(LinearMethod):
     def create_weights(self, layer: Any) -> None:
         g = self.cfg
         block = fp8_block_size(g.scheme)
-        if g.in_features % block or any(o % block for o in g.output_sizes):
+        # K is one activation-quant group grid. A fused N splits on block boundaries.
+        # One output may end inside a block (MLA kv_a is 576); its scale grid is ceil(N/block)
+        # and the GEMM zero-pads that tail. e8m0 and non-128 blocks stay exact.
+        partial = (
+            not _e8m0(g)
+            and block == FP8_BLOCK
+            and len(g.output_sizes) == 1
+            and g.output_sizes[0] % block != 0
+        )
+        if g.in_features % block or (not partial and any(o % block for o in g.output_sizes)):
             raise ValueError(f"block-fp8 needs in/out sizes divisible by {block}, got K={g.in_features} N={g.output_sizes}")
         layer.weight = torch.empty(g.out_features, g.in_features, dtype=FP8)
         # e8m0 codes stay codes for the dsv4 kernel; float scales are bf16 as the readers push them today
         scale_dtype = E8M0 if _e8m0(g) else torch.bfloat16
-        layer.weight_scale_inv = torch.empty(g.out_features // block, g.in_features // block, dtype=scale_dtype)
+        scale_rows = (g.out_features + block - 1) // block
+        layer.weight_scale_inv = torch.empty(scale_rows, g.in_features // block, dtype=scale_dtype)

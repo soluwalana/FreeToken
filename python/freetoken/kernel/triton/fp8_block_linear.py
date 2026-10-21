@@ -239,20 +239,46 @@ def _block_fp8_gemv(a, weight, weight_scale, out_dtype, a_scale=None):
     return out
 
 
+def _scale_rows(n: int) -> int:
+    return (n + _BLOCK - 1) // _BLOCK
+
+
+def _pad_n(weight: torch.Tensor, weight_scale: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Zero-pad N up to a multiple of 128. The scale grid is already ``ceil(N/128)`` rows,
+    so the padded tail shares the last block's scale and contributes zeros."""
+    n = weight.shape[0]
+    need = _scale_rows(n)
+    if weight_scale.shape[0] < need:
+        raise ValueError(f"block-fp8 scale has {weight_scale.shape[0]} rows for N={n}; need {need}")
+    if n % _BLOCK == 0:
+        return weight, n
+    pad = need * _BLOCK - n
+    tail = torch.zeros((pad, weight.shape[1]), dtype=weight.dtype, device=weight.device)
+    return torch.cat((weight, tail), dim=0), n
+
+
 def block_fp8_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``y = x @ weight^T`` with block-fp8 weight. Decode (M=1) uses a W8A16 split-K GEMV
     (bf16 activation, weight-only dequant -- no act-quant kernel); prefill (M>1) uses the
-    W8A8 block GEMM."""
+    W8A8 block GEMM. A weight whose N is not a multiple of 128 (MLA ``kv_a`` is 576) is
+    zero-padded to the next block for the GEMM and sliced back."""
     *lead, K = x.shape
-    N = weight.shape[0]
+    logical_n = weight.shape[0]
+    if weight_scale.shape[0] < _scale_rows(logical_n):
+        raise ValueError(
+            f"block-fp8 scale has {weight_scale.shape[0]} rows for N={logical_n}; need {_scale_rows(logical_n)}"
+        )
     if x.numel() // K == 1:  # decode bs=1: W8A16 GEMV (bf16 act, no per-token-group quant)
-        out = _block_fp8_gemv(x.reshape(K), weight, weight_scale, x.dtype).reshape(*lead, N)
+        out = _block_fp8_gemv(x.reshape(K), weight, weight_scale, x.dtype).reshape(*lead, logical_n)
     else:
+        aligned, logical_n = _pad_n(weight, weight_scale)
         a_fp8, a_scale = per_token_group_quant_fp8(x, _BLOCK)
-        out = block_fp8_matmul(a_fp8, a_scale, weight, weight_scale, x.dtype).reshape(*lead, N)
+        out = block_fp8_matmul(a_fp8, a_scale, aligned, weight_scale, x.dtype).reshape(*lead, aligned.shape[0])
+        if aligned.shape[0] != logical_n:
+            out = out[..., :logical_n]
     if bias is not None:
         out = out + bias.to(out.dtype)
     return out

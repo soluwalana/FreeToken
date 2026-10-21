@@ -206,6 +206,29 @@ def test_fp8_pieces_are_the_owned_subset_with_dense_rows(tmp_path):
     assert set(seen[0].values()) | set(seen[1].values()) == {0, 1, 2, 3}
 
 
+def test_glm_dsa_fp8_pieces_use_the_model_layers_layout(tmp_path):
+    from freetoken.models.glm_moe_dsa.weight import iter_expert_pieces
+
+    tensors = {}
+    for expert in range(4):
+        for proj in ("gate", "up", "down"):
+            base = f"model.layers.0.mlp.experts.{expert}.{proj}_proj"
+            tensors[f"{base}.weight"] = torch.zeros(4, dtype=torch.float8_e4m3fn)
+            tensors[f"{base}.weight_scale_inv"] = torch.tensor([float(expert)])
+    save_file(tensors, tmp_path / "model.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {name: "model.safetensors" for name in tensors},
+    }))
+    set_ep_info(1, 2)
+    pieces = list(iter_expert_pieces(str(tmp_path), _expert_config(), QuantKind.FP8_BLOCK, parallel=False))
+    rows = {}
+    for _layer, e0, e1, piece in pieces:
+        assert e1 == e0 + 1
+        rows[e0] = int(piece["gate_scale"].reshape(-1)[0])
+        assert piece["gate_scale"].dtype == torch.bfloat16
+    assert rows == {0: 1, 1: 3}
+
+
 def test_nvfp4_piece_count_accepts_the_owned_subset(tmp_path):
     from freetoken.models.glm5_next.weight import _NVFP4_SOURCE_SPEC
     from freetoken.models.nvfp4_banks import iter_nvfp4_expert_pieces

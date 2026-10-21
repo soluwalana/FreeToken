@@ -1,22 +1,23 @@
-"""Weight loading for GLM-5.2 (``glm_moe_dsa``).
+"""Weight loading for GLM-5.2 / GLM-5.3 (``glm_moe_dsa``).
 
-Resident (non routed-expert) weights stream through verbatim in the checkpoint's precision (bf16). The
-router selection bias is remapped ``mlp.gate.e_score_correction_bias ->
-mlp.e_score_correction_bias``; the DSA indexer tensors load bf16 on "full" indexer
-layers (serving runs faithful DSA top-k sparse attention; see attention.py); only the
-trailing MTP layer is skipped. Routed experts are NVFP4
-and go to the offload cache via the shared glm4_moe loader (identical key layout).
+Resident projections load as stored: bf16, or fp8-e4m3 codes with their block scales.
+``kv_b_proj`` and the indexer's ``wk`` / ``weights_proj`` are served bf16 (MLA absorption
+reads ``kv_b`` as a bmm; the indexer top-k stays in bf16), so an fp8 copy is dequantized
+here. The router selection bias is remapped ``mlp.gate.e_score_correction_bias ->
+mlp.e_score_correction_bias``. Only the trailing MTP layer is skipped. Routed experts
+are NVFP4 (glm4_moe key layout) or block-fp8 and go to the offload cache.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Iterator
 
 import safetensors
 import torch
-from freetoken.distributed import get_tp_info
+from freetoken.layers.quantization import QuantKind
 from freetoken.models.glm4_moe.weight import (
     nvfp4_expert_spec,
 )
@@ -26,7 +27,7 @@ from tqdm import tqdm
 
 from .config import parse_config
 
-# fp8-e4m3 dynamic range for the per-row W8A16 quantization of the big MLA projections.
+
 class _ShardReader:
     def __init__(self, folder: str, weight_map: dict, device: torch.device):
         self._folder = folder
@@ -57,6 +58,42 @@ class _ShardReader:
         self._handles.clear()
 
 
+def _proj(reader, src: str, dst: str, *, bf16: bool = False) -> Iterator[tuple[str, torch.Tensor]]:
+    """One projection as the module stores it. ``bf16`` dequantizes a block-fp8 checkpoint tensor."""
+    w = reader.get(f"{src}.weight")
+    if w.dtype != torch.float8_e4m3fn:
+        yield f"{dst}.weight", w.to(torch.bfloat16)
+        return
+    scale = reader.get(f"{src}.weight_scale_inv")
+    if not bf16:
+        yield f"{dst}.weight", w
+        yield f"{dst}.weight_scale_inv", scale
+        return
+    from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
+
+    yield f"{dst}.weight", dequant_block_fp8(w, scale)
+
+
+_FP8_EXPERT_RE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)$"
+)
+
+
+def _layer_to_bank(layer: int, config):
+    if layer < config.first_k_dense_replace or layer >= config.num_layers:
+        return None
+    return layer - config.first_k_dense_replace
+
+
+def _bf16_scales(tensors):
+    """Expert scale banks are bf16. Checkpoints store the block scales as fp32."""
+    for name, tensor in tensors:
+        if name.endswith("weight_scale_inv") and tensor.dtype != torch.bfloat16:
+            tensor = tensor.to(torch.bfloat16)
+        yield name, tensor
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -65,16 +102,17 @@ def iter_weights(
     include_non_moe: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     assert not include_moe_experts, (
-        "GLM-5.2 stores routed experts as NVFP4 and only supports the offload backend; "
-        "experts are loaded into the offload cache from their NVFP4 pieces."
+        "GLM routed experts only serve from the offload cache; they are loaded from their expert pieces."
     )
     assert include_non_moe
+    from freetoken.moe.expert_parallel import is_rank0
+
     config = parse_config(cached_load_hf_config(model_path))
     folder = download_hf_weight(model_path)
     with open(os.path.join(folder, "model.safetensors.index.json")) as f:
         weight_map = json.load(f)["weight_map"]
     reader = _ShardReader(folder, weight_map, device)
-    primary = get_tp_info().is_primary()
+    primary = is_rank0()
     dense = config.first_k_dense_replace
     try:
         for layer in tqdm(
@@ -84,15 +122,17 @@ def iter_weights(
         ):
             a = f"model.layers.{layer}.self_attn"
             for proj in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
-                yield f"{a}.{proj}.weight", reader.get(f"{a}.{proj}.weight")
+                yield from _proj(reader, f"{a}.{proj}", f"{a}.{proj}", bf16=proj == "kv_b_proj")
             for norm in ("q_a_layernorm", "kv_a_layernorm"):
                 yield f"{a}.{norm}.weight", reader.get(f"{a}.{norm}.weight")
             # DSA lightning indexer ("full" layers only; "shared" layers reuse their
-            # group leader's selection and ship no indexer tensors). Always bf16.
+            # group leader's selection and ship no indexer tensors).
             idx_types = config.glm_dsa_args.indexer_types
             if idx_types and idx_types[layer] == "full":
-                for proj in ("wq_b", "wk", "weights_proj"):
-                    yield f"{a}.indexer.{proj}.weight", reader.get(f"{a}.indexer.{proj}.weight")
+                yield from _proj(reader, f"{a}.indexer.wq_b", f"{a}.indexer.wq_b")
+                # wk and weights_proj stay bf16 in the module (top-k). An fp8 wk is dequantized.
+                for proj in ("wk", "weights_proj"):
+                    yield from _proj(reader, f"{a}.indexer.{proj}", f"{a}.indexer.{proj}", bf16=True)
                 yield f"{a}.indexer.k_norm.weight", reader.get(f"{a}.indexer.k_norm.weight")
                 yield f"{a}.indexer.k_norm.bias", reader.get(f"{a}.indexer.k_norm.bias")
             for norm in ("input_layernorm", "post_attention_layernorm"):
@@ -105,7 +145,7 @@ def iter_weights(
 
             if layer < dense:
                 for proj in ("gate_proj", "up_proj", "down_proj"):
-                    yield f"{m}.{proj}.weight", reader.get(f"{m}.{proj}.weight")
+                    yield from _proj(reader, f"{m}.{proj}", f"{m}.{proj}")
             else:
                 yield f"{m}.gate.weight", reader.get(f"{m}.gate.weight")
                 yield (
@@ -113,7 +153,7 @@ def iter_weights(
                     reader.get(f"{m}.gate.e_score_correction_bias").to(torch.bfloat16),
                 )
                 for proj in ("gate_proj", "up_proj", "down_proj"):
-                    yield f"{m}.shared_experts.{proj}.weight", reader.get(f"{m}.shared_experts.{proj}.weight")
+                    yield from _proj(reader, f"{m}.shared_experts.{proj}", f"{m}.shared_experts.{proj}")
 
         yield "model.embed_tokens.weight", reader.get("model.embed_tokens.weight")
         yield "model.norm.weight", reader.get("model.norm.weight")
@@ -122,4 +162,64 @@ def iter_weights(
         reader.close()
 
 
-__all__ = ["iter_weights", "nvfp4_expert_spec"]
+def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+    """Block-fp8 routed experts, one piece per owned expert. Other kinds use the generic readers."""
+    if kind is not QuantKind.FP8_BLOCK:
+        return None
+    from freetoken.distributed import get_tp_info
+    from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
+    from freetoken.moe.expert_parallel import is_rank0, remap_expert
+    from freetoken.moe.expert_pieces import per_expert_pieces
+
+    if get_tp_info().size > 1:
+        raise NotImplementedError("glm_moe_dsa fp8 expert banks support TP=1 only")
+
+    suffix = {"weight": "", "weight_scale_inv": "_scale"}
+    keep = None if layers is None else set(layers)
+
+    def locate(raw_name: str):
+        m = _FP8_EXPERT_RE.match(raw_name)
+        if m is None:
+            return None
+        bank = _layer_to_bank(int(m["layer"]), config)
+        if bank is None or (keep is not None and bank not in keep):
+            return None
+        row = remap_expert(int(m["expert"]))
+        if row is None:
+            return None
+        return bank, row, m["proj"] + suffix[m["kind"]]
+
+    if parallel is None:
+        parallel = experts_scattered(model_path)
+    if parallel:
+        tensors = iter_expert_tensors_parallel(
+            model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk
+        )
+        return per_expert_pieces(_bf16_scales(tensors), locate, tensors_per_expert=6)
+
+    def _serial():
+        folder = download_hf_weight(model_path)
+        with open(os.path.join(folder, "model.safetensors.index.json")) as f:
+            weight_map = json.load(f)["weight_map"]
+        reader = _ShardReader(folder, weight_map, torch.device("cpu"))
+        try:
+            ckpt_layers = [
+                layer for layer in range(config.first_k_dense_replace, config.num_layers)
+                if keep is None or _layer_to_bank(layer, config) in keep
+            ]
+            for layer in tqdm(ckpt_layers, desc="Loading GLM fp8 experts (serial)", disable=not is_rank0()):
+                for e in range(config.num_experts):
+                    if remap_expert(e) is None:
+                        continue
+                    base = f"model.layers.{layer}.mlp.experts.{e}"
+                    for proj in ("gate", "up", "down"):
+                        for kind_name in suffix:
+                            name = f"{base}.{proj}_proj.{kind_name}"
+                            yield name, reader.get(name)
+        finally:
+            reader.close()
+
+    return per_expert_pieces(_bf16_scales(_serial()), locate, tensors_per_expert=6)
+
+
+__all__ = ["iter_weights", "iter_expert_pieces", "nvfp4_expert_spec"]
