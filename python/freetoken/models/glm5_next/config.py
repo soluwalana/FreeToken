@@ -33,6 +33,7 @@ from freetoken.models.config import (
     RotaryConfig,
     detect_expert_quant,
 )
+from freetoken.models.glm_experts import routed_expert_quant
 
 from .args import load_args
 
@@ -199,7 +200,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
 
     expert_quant, weight_block_size = _fp8_block_quant(hf_config)
     if expert_quant == "none":
-        expert_quant = detect_expert_quant(hf_config)
+        expert_quant = routed_expert_quant(hf_config, detect_expert_quant(hf_config))
     return ModelConfig(
         num_layers=num_layers,
         num_qo_heads=args.num_heads,

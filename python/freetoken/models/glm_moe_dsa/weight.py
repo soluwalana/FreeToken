@@ -268,4 +268,11 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
     return per_expert_pieces(_bf16_scales(_serial()), locate, tensors_per_expert=6)
 
 
-__all__ = ["iter_weights", "iter_expert_pieces", "nvfp4_expert_spec"]
+def disk_expert_keys(kind: QuantKind):
+    """Checkpoint keys ``--moe-disk`` indexes. GLM-5.3 stores experts under ``model.layers``."""
+    from freetoken.models.glm_experts import projection_disk_keys
+
+    return projection_disk_keys("model.layers", kind)
+
+
+__all__ = ["iter_weights", "iter_expert_pieces", "nvfp4_expert_spec", "disk_expert_keys"]

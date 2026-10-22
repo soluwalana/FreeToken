@@ -366,4 +366,11 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
     return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
-__all__ = ["iter_weights", "iter_expert_pieces", "nvfp4_expert_spec"]
+def disk_expert_keys(kind: QuantKind):
+    """Checkpoint keys ``--moe-disk`` indexes. Flash nests experts under ``model.language_model``."""
+    from freetoken.models.glm_experts import projection_disk_keys
+
+    return projection_disk_keys("model.language_model.layers", kind)
+
+
+__all__ = ["iter_weights", "iter_expert_pieces", "nvfp4_expert_spec", "disk_expert_keys"]

@@ -23,6 +23,7 @@ from freetoken.models.config import (
     RotaryConfig,
     detect_expert_quant,
 )
+from freetoken.models.glm_experts import routed_expert_quant
 
 from .args import load_args
 
@@ -105,7 +106,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         model_type=getattr(hf_config, "model_type", "glm_moe_dsa"),
         architectures=getattr(hf_config, "architectures", ["GlmMoeDsaForCausalLM"]),
         moe_enabled=True,
-        expert_quant=detect_expert_quant(hf_config),
+        expert_quant=routed_expert_quant(hf_config, detect_expert_quant(hf_config)),
         first_k_dense_replace=int(getattr(hf_config, "first_k_dense_replace", 0)),
         n_shared_experts=int(getattr(hf_config, "n_shared_experts", 0)),
         routed_scaling_factor=float(getattr(hf_config, "routed_scaling_factor", 1.0)),

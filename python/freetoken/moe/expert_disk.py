@@ -5,9 +5,10 @@ pinned bounce, aliased as every layer, so the existing copy plan and slot ids st
 A pinned window in front of the checkpoint holds rows the GPU has evicted but a later
 token still wants. A miss that is also absent from that window is read from the safetensors
 shard and packed into the kernel's native rows. Block-fp8 and NVFP4 (``triton``
-and ``w4a4``) are the formats this reader knows. The pad row stays zero and is
-never stored. NVFP4 rows stay packed; the inline-dequant GEMM is a kernel choice,
-not a second copy in the window.
+and ``w4a4``) are the formats this reader knows. Which checkpoint keys those
+rows live under comes from the model's ``disk_expert_keys``. The pad row stays
+zero and is never stored. NVFP4 rows stay packed; the inline-dequant GEMM is a
+kernel choice, not a second copy in the window.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import struct
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -35,24 +35,8 @@ DISK_NVFP4_KERNELS = ("triton", "w4a4")
 # A disk prefill that already touches this much of the owned rows keeps the sequential read.
 _WHOLE_LAYER_NUMERATOR = 9
 _WHOLE_LAYER_DENOMINATOR = 10
-
-# Routed experts. GLM-5.3 stores them at model.layers; GLM-5.3-Flash at
-# model.language_model.layers. The bank layer is the checkpoint layer minus the leading dense layers.
-_LAYER_EXPERT = r"^model\.(?:language_model\.)?layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-_FP8_KEY = re.compile(
-    _LAYER_EXPERT + r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)$"
-)
-_NVFP4_KEY = re.compile(
-    _LAYER_EXPERT + r"(?P<proj>gate|up|down)_proj\.(?P<kind>weight_scale_2|weight_scale|weight)$"
-)
-_INPUT_KEY = re.compile(
-    _LAYER_EXPERT + r"(?P<proj>gate|up|down)_proj\.input_scale$"
-)
+# Bank roles the native-row kernels pack. The model's key spec maps checkpoint projections onto these.
 _PROJECTIONS = ("gate", "up", "down")
-_FP8_SUFFIX = {"weight": "", "weight_scale_inv": "_scale"}
-_NVFP4_SUFFIX = {"weight": "", "weight_scale": "_scale", "weight_scale_2": "_global"}
-_FP8_PIECES = 6
-_NVFP4_PIECES = 9
 
 _SAFETENSORS_DTYPE = {
     "BOOL": torch.bool,
@@ -91,17 +75,22 @@ def packed_row_bytes(layout) -> int:
     return total
 
 
-def _key_spec(kind: QuantKind) -> tuple[re.Pattern[str], dict[str, str], int, str]:
-    if kind is QuantKind.NVFP4:
-        return (
-            _NVFP4_KEY,
-            _NVFP4_SUFFIX,
-            _NVFP4_PIECES,
-            "{weight,weight_scale,weight_scale_2}",
-        )
-    if kind is QuantKind.FP8_BLOCK:
-        return _FP8_KEY, _FP8_SUFFIX, _FP8_PIECES, "{weight,weight_scale_inv}"
-    raise ValueError(f"--moe-disk has no expert index for {kind}")
+def _disk_keys(model_config, kind: QuantKind):
+    """The family's checkpoint key spec. The reader does not know model tensor names."""
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    archs = getattr(model_config, "architectures", None) or []
+    if not archs:
+        raise ValueError("--moe-disk needs the checkpoint architecture to find expert keys")
+    spec = get_model_spec(archs[0])
+    try:
+        hook = _load_attr(spec.module, "disk_expert_keys")
+    except AttributeError:
+        hook = None
+    keys = hook(kind) if hook is not None else None
+    if keys is None:
+        raise ValueError(f"--moe-disk has no expert index for {archs[0]} ({kind})")
+    return keys
 
 
 def build_expert_index(
@@ -130,7 +119,8 @@ def _scan_expert_index(
 ) -> tuple[dict[tuple[int, int, str], TensorLoc], dict[tuple[int, int, str], TensorLoc]]:
     from freetoken.models.loader import safetensors_weight_map
 
-    pattern, suffixes, pieces, names = _key_spec(kind)
+    keys = _disk_keys(model_config, kind)
+    pattern, suffixes, pieces = keys.pattern, keys.suffixes, keys.pieces
     first_k = int(getattr(model_config, "first_k_dense_replace", 0) or 0)
     num_moe_layers = model_config.num_moe_layers
     owned, _rows = bank_geometry(model_config.num_experts, size)
@@ -139,8 +129,8 @@ def _scan_expert_index(
     for name, shard in safetensors_weight_map(folder).items():
         match = pattern.match(name)
         side = False
-        if match is None and kind is QuantKind.NVFP4:
-            match = _INPUT_KEY.match(name)
+        if match is None and keys.input_pattern is not None:
+            match = keys.input_pattern.match(name)
             side = match is not None
         if match is None:
             continue
@@ -185,8 +175,7 @@ def _scan_expert_index(
         raise ValueError(
             f"--moe-disk indexed {len(index)} expert tensors, expected {expected} "
             f"({num_moe_layers} layers x {owned} owned experts x {pieces}). "
-            "The reader looks for model.layers.{L}.mlp.experts.{E}.{gate,up,down}_proj."
-            f"{names}, or the same key under model.language_model.layers."
+            f"The reader looks for {keys.where}{keys.names}."
         )
     return index, inputs
 
@@ -287,17 +276,11 @@ class DiskExpertStore:
     def stage(self, cache) -> None:
         """Fill ``bounce[row]`` for each id in ``cache.src_indices``. A GPU hit is not in that list."""
         layer = int(cache._pending_src_layer)
-        if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
-            print(f"[moe-disk] stage.item layer={layer}", flush=True)
         n = int(cache.num_indices.item())
-        if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
-            print(f"[moe-disk] stage n={n} layer={layer}", flush=True)
         if n <= 0:
             return
         rows = cache.src_indices[:n].detach().to(dtype=torch.int64, device="cpu").tolist()
         self.stage_rows(layer, rows, pad=cache.ep_pad)
-        if os.environ.get("FREETOKEN_MOE_DISK_TRACE"):
-            print(f"[moe-disk] stage filled layer={layer} rows={len(rows)}", flush=True)
 
     def stage_rows(self, layer: int, rows: list[int], *, pad: int | None) -> None:
         for row in rows:

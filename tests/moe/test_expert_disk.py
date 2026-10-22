@@ -29,9 +29,11 @@ def _scale(layer: int, expert: int, proj: int) -> torch.Tensor:
     return torch.tensor([[float((layer + 1) * 100 + expert * 10 + proj)]], dtype=torch.float32)
 
 
-def _model():
+def _model(architecture="GlmMoeDsaForCausalLM"):
     # Checkpoint layer 0 is dense. Banks 0 and 1 are checkpoint layers 1 and 2.
-    return SimpleNamespace(num_experts=4, num_moe_layers=2, first_k_dense_replace=1)
+    return SimpleNamespace(
+        num_experts=4, num_moe_layers=2, first_k_dense_replace=1, architectures=[architecture],
+    )
 
 
 @pytest.fixture(scope="module")
@@ -289,7 +291,9 @@ def test_language_model_prefix_is_indexed(tmp_path):
     index = {"metadata": {}, "weight_map": {key: name for key in tensors}}
     with open(os.path.join(tmp_path, "model.safetensors.index.json"), "w", encoding="utf-8") as fh:
         json.dump(index, fh)
-    got = build_expert_index(tmp_path, _model(), rank=0, size=2, kind=QuantKind.NVFP4)
+    got = build_expert_index(
+        tmp_path, _model("Glm5NextForConditionalGeneration"), rank=0, size=2, kind=QuantKind.NVFP4,
+    )
     # Two banks, two owned rows, nine pieces.
     assert len(got) == 2 * 2 * 9
     assert (0, 0, "gate_global") in got
@@ -318,6 +322,7 @@ def test_nvfp4_fetch_matches_pack(nvfp4_shard, nvfp4_method):
 
 def test_detect_modelopt_mixed_precision_experts():
     from freetoken.models.config import detect_expert_quant
+    from freetoken.models.glm_experts import routed_expert_quant
 
     mixed = SimpleNamespace(quantization_config={
         "quant_method": "modelopt",
@@ -327,17 +332,19 @@ def test_detect_modelopt_mixed_precision_experts():
             "model.layers.3.mlp.experts": {"quant_algo": "NVFP4"},
         },
     })
-    assert detect_expert_quant(mixed) == "nvfp4"
+    assert detect_expert_quant(mixed) == "mixed_precision"
+    assert routed_expert_quant(mixed, "mixed_precision") == "nvfp4"
     w4a16 = SimpleNamespace(quantization_config={
         "quant_algo": "MIXED_PRECISION",
         "quantized_layers": {"model.layers.3.mlp.experts": {"quant_algo": "W4A16_NVFP4"}},
     })
-    assert detect_expert_quant(w4a16) == "nvfp4"
+    assert routed_expert_quant(w4a16, detect_expert_quant(w4a16)) == "nvfp4"
     fp8 = SimpleNamespace(quantization_config={
         "quant_algo": "FP8",
         "quantized_layers": {"model.layers.3.mlp.experts": {"quant_algo": "NVFP4"}},
     })
     assert detect_expert_quant(fp8) == "fp8"
+    assert routed_expert_quant(fp8, "fp8") == "fp8"
 
 
 def test_triton_dequant_follows_compute_capability(monkeypatch):
