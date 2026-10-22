@@ -52,6 +52,10 @@ def test_q4_matrix_matches_cpu(dtype, batch):
     torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
 
 
+def _route_reference(x, ref, ids):
+    return torch.einsum("tk, tjok -> tjo", x.cpu().float(), ref[ids.cpu().long()]).to(x.dtype)
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch", [1, 17])
 def test_q4_moe_routes_match_cpu(dtype, batch):
@@ -59,8 +63,52 @@ def test_q4_moe_routes_match_cpu(dtype, batch):
     x = _activation((batch, 256), dtype)
     ids = torch.tensor([[i % 4, (i + 1) % 4] for i in range(batch)], dtype=torch.int32, device="cuda")
     actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids)
-    expected = torch.einsum("tk, tjok -> tjo", x.cpu().float(), ref[ids.cpu().long()]).to(dtype)
-    torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
+    torch.testing.assert_close(actual.cpu(), _route_reference(x, ref, ids), atol=2e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_q4_moe_vector_kernel_writes_repeated_ids(dtype):
+    """The small-batch kernel evaluates every route, including a repeated expert id."""
+    w, ref = _q4_weights((4, 64, 256))
+    x = _activation((1, 256), dtype)
+    ids = torch.tensor([[0, 0, 3]], dtype=torch.int32, device="cuda")
+    actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids)
+    torch.testing.assert_close(actual.cpu(), _route_reference(x, ref, ids), atol=2e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("topk", [3, 8])
+def test_q4_moe_matrix_kernel_collapses_repeated_ids(dtype, topk):
+    """MMQ keeps one column when a token repeats an expert.
+
+    Expert parallel points every unowned route at one pad row. Those extra columns stay zero,
+    and a higher expert's column still belongs to that expert.
+    """
+    batch = 17
+    w, ref = _q4_weights((4, 64, 256))
+    x = _activation((batch, 256), dtype)
+    ids = torch.zeros(batch, topk, dtype=torch.int32, device="cuda")
+    ids[:, :-1] = 0
+    ids[:, -1] = 3
+    actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids)
+    assert torch.isfinite(actual).all()
+    ref0 = _route_reference(x, ref, torch.zeros_like(ids[:, :1]))[:, 0]
+    ref3 = _route_reference(x, ref, torch.full_like(ids[:, :1], 3))[:, 0]
+    torch.testing.assert_close(actual[:, 0].cpu(), ref0, atol=2e-4, rtol=1e-3)
+    torch.testing.assert_close(actual[:, -1].cpu(), ref3, atol=2e-4, rtol=1e-3)
+    assert torch.count_nonzero(actual[:, 1:-1]) == 0
+
+    # The pad row is the highest id, and every copy of it has weight 0.
+    pad = torch.zeros_like(ids)
+    pad[:, 0] = torch.arange(batch, device="cuda") % 3
+    pad[:, 1:] = 3
+    routed = ggml.mul_mat_id(w, int(QType.Q4_0), x, pad)
+    weights = torch.zeros(batch, topk, dtype=torch.float32, device="cuda")
+    weights[:, 0] = 1
+    summed = ggml.moe_weighted_sum(routed, weights)
+    owned = _route_reference(x, ref, pad[:, :1])[:, 0]
+    assert torch.isfinite(summed).all()
+    torch.testing.assert_close(summed.cpu(), owned, atol=2e-4, rtol=1e-3)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

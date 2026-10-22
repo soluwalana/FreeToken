@@ -1088,18 +1088,21 @@ class OffloadMoeCache:
                 f"every MoE pool needs at least {self.num_experts} slots "
                 f"(smallest has {min(self.pool_sizes)})"
             )
+        from freetoken.moe.expert_parallel import EP_PAD_USAGE
+
         self.ep_pad = pad
+        # Device scalars: capture records a device copy. A Python int becomes a CPU tensor, which capture rejects.
+        self._ep_pad_slot = torch.tensor(pad, dtype=torch.int32, device=self.device)
+        self._ep_pad_usage = torch.tensor(EP_PAD_USAGE, dtype=torch.int64, device=self.device)
         self._pin_ep_pad()
 
     def _pin_ep_pad(self) -> None:
         pad = self.ep_pad
         if pad is None:
             return
-        from freetoken.moe.expert_parallel import EP_PAD_USAGE
-
-        self.slot_for_id[:, pad] = pad
+        self.slot_for_id[:, pad] = self._ep_pad_slot
         for usage in self._pool_usage:
-            usage[pad] = EP_PAD_USAGE
+            usage[pad] = self._ep_pad_usage
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts

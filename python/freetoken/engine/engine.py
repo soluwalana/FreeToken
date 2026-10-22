@@ -1021,10 +1021,15 @@ class Engine:
         return sum(s * self._moe_layer_slot_bytes[g[0]] for g, s in zip(self._moe_pool_groups, pool_sizes))
 
     def _moe_pools(self, batch: int) -> list:
-        """The slot pools, each with room for the routed experts of ``batch`` decode tokens."""
+        """The slot pools, each with room for the routed experts of ``batch`` decode tokens.
+
+        Expert parallel pins the pad row at local slot ``num_experts - 1`` in every pool, so a
+        pool sized for one decode step cannot hold it. The floor is the whole local bank.
+        """
         model_config = self.config.model_config
         num_experts = _expert_rows(self.config)
-        min_num_slots = min(num_experts, model_config.num_experts_per_tok * batch)
+        step = model_config.num_experts_per_tok * batch
+        min_num_slots = num_experts if self.config.ep_info.size > 1 else min(num_experts, step)
         return make_pools(self._moe_pool_groups, num_experts, min_num_slots, self._moe_slot_limit)
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:

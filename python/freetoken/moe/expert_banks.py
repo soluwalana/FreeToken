@@ -455,13 +455,10 @@ def load_expert_banks(
         if mixed:
             return _mixed_expert_banks(model_path, model_config, layer_methods, device, dummy, par, workers, chunk, layer_sink)
         if method is not None and method.kind is QuantKind.GGUF:
-            from freetoken.distributed import get_ep_info
             from freetoken.models.gguf.experts import load_gguf_expert_banks
 
-            if get_ep_info().size > 1:
-                raise ValueError("expert parallelism does not support GGUF expert banks")
-
-            # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout
+            # each layer keeps its own ggml types, so the banks come from the file, not from one method's layout.
+            # expert parallel stripes those rows inside the loader (id % size == rank, plus the zero pad).
             return load_gguf_expert_banks(model_path, model_config.num_moe_layers, first_layer=model_config.first_k_dense_replace, dummy=dummy, device=device if resident else None)
         if method is None:
             raise ValueError("the experts of a raw checkpoint are packed by the offload layers' MoE quant method; pass method=")

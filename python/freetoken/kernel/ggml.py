@@ -101,8 +101,15 @@ def mul_mat_id(w: torch.Tensor, ggml_type: int, x: torch.Tensor, ids: torch.Tens
     ``scale`` is an fp32 ``[E]`` view (strided is fine) that multiplies each NVFP4 expert's rows; it needs ``T <= mmvq_max_tokens``.
     """
     t, top_k = ids.shape
-    out = torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
-    if t > mmvq_max_tokens(ggml_type):
+    # The matrix kernel writes one column per (token, expert). Expert parallel sends every
+    # unowned route to the same pad row, so the columns it skips have to start at zero.
+    mmq = t > mmvq_max_tokens(ggml_type)
+    out = (
+        torch.zeros(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
+        if mmq
+        else torch.empty(t, top_k, w.shape[1], dtype=x.dtype, device=x.device)
+    )
+    if mmq:
         _check_mmq_tail(w, ggml_type, x.shape[-1])
     _module().mul_mat_id(w, ggml_type, (x.unsqueeze(1) if x.dim() == 2 else x).contiguous(), ids, out, scale)
     return out

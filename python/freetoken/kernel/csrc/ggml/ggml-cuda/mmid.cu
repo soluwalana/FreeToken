@@ -28,6 +28,7 @@ template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
 // ids_dst describes the same mapping but for the dst tensor.
 // The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
+// A token that names one expert on several routes takes one compact column. The other routes are left untouched, so the caller zero-fills the output.
 template <int n_expert_used_template>
 __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper(
@@ -49,14 +50,36 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
             }
+            // Distinct lower ids. Repeated routes share one column, so a later expert must not
+            // count each copy or it will read past the columns this helper wrote.
+            if (threadIdx.x == 0) {
+                int distinct = 0;
+                for (int iex = 0; iex < n_expert_used; ++iex) {
+                    const int id = ids[it*si1 + iex];
+                    if (id >= expert) {
+                        continue;
+                    }
+                    int seen = 0;
+                    for (int prev = 0; prev < iex; ++prev) {
+                        seen |= ids[it*si1 + prev] == id;
+                    }
+                    distinct += !seen;
+                }
+                nex_prev += distinct;
+            }
 
-            if (iex_used != -1) {
-                store[it_compact] = mm_ids_helper_store(it, iex_used);
+            // The lowest matching route owns the one compact column. The other copies stay zero.
+            int match_iex = iex_used < 0 ? 0x7fffffff : iex_used;
+#pragma unroll
+            for (int offset = warp_size / 2; offset > 0; offset >>= 1) {
+                match_iex = min(match_iex, __shfl_xor_sync(0xffffffff, match_iex, offset, warp_size));
+            }
+            if (threadIdx.x == 0 && match_iex != 0x7fffffff) {
+                store[it_compact] = mm_ids_helper_store(it, match_iex);
             }
 
             if (warp_reduce_any<warp_size>(iex_used != -1)) {
@@ -75,7 +98,21 @@ static __global__ void mm_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            // One column per distinct lower id. Unique ids are unchanged; copies of one id count once.
+            int first = expert_used < expert;
+#pragma unroll
+            for (int prev = 0; prev < neu_padded; ++prev) {
+                const int other = __shfl_sync(0xffffffff, expert_used, prev, neu_padded);
+                first &= !(prev < iex && other == expert_used);
+            }
+            int distinct = first;
+#pragma unroll
+            for (int offset = neu_padded / 2; offset > 0; offset >>= 1) {
+                distinct += __shfl_xor_sync(0xffffffff, distinct, offset, neu_padded);
+            }
+            if (iex == 0) {
+                nex_prev += distinct;
+            }
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -90,7 +127,13 @@ static __global__ void mm_ids_helper(
                 }
             }
 
-            if (iex_used != -1) {
+            int winner = iex_used != -1;
+#pragma unroll
+            for (int prev = 0; prev < neu_padded; ++prev) {
+                const int other = __shfl_sync(0xffffffff, iex_used, prev, neu_padded);
+                winner &= !(prev < iex && other != -1);
+            }
+            if (winner) {
                 store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
             }
 
@@ -106,9 +149,15 @@ static __global__ void mm_ids_helper(
         const int it       = store_it.it();
         const int iex_used = store_it.iex_used();
         ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
-        // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
+        // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup.
+        // Every route that names this expert shares that one compact row, including repeated ids.
         if (write_inverse) {
-            ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
+            const int col = nex_prev + itc;
+            for (int slot = 0; slot < n_expert_used; ++slot) {
+                if (ids[it*si1 + slot] == expert) {
+                    ids_src1[it*n_expert_used + slot] = col;
+                }
+            }
         } else {
             ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
         }

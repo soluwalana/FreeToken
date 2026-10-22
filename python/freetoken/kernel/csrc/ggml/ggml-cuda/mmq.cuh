@@ -1488,6 +1488,10 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         if (via_f32) {
             GGML_ASSERT(args.ids_dst || (args.nchannels_y == 1 && args.nsamples_y == 1));
             dst_float = dst_f32.alloc(args.ncols_dst * args.nrows_dst);
+            // MoE may leave columns unwritten when one expert is named twice. The store copies every column, and the pool buffer is dirty.
+            if (args.ids_dst) {
+                CUDA_CHECK(cudaMemsetAsync(dst_float, 0, sizeof(float) * args.ncols_dst * args.nrows_dst, stream));
+            }
         }
 
         if (dst_float) {

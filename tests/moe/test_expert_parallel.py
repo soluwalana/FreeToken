@@ -438,3 +438,50 @@ def test_ensure_treats_the_pad_slot_as_a_hit():
     assert n_copy == 1
     assert int(cache.src_indices[0]) == 0
     assert pad not in cache.src_indices[:n_copy].tolist()
+
+
+def test_pin_ep_pad_survives_cuda_graph_capture():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graph capture")
+    from freetoken.moe.expert_parallel import EP_PAD_USAGE
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    device = torch.device("cuda")
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=3, cache_size=3, device=device, prefill_overlap=False,
+    )
+    cache.install_ep_pad()
+    cache._pin_ep_pad()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cache._pin_ep_pad()
+    cache.usage.zero_()
+    cache.slot_for_id.fill_(-1)
+    graph.replay()
+    pad = cache.ep_pad
+    assert int(cache.usage[pad]) == EP_PAD_USAGE
+    assert int(cache.slot_for_id[0, pad]) == pad
+
+
+def test_expert_parallel_gives_every_pool_the_pad_slot():
+    """UD GGUF keeps one pool per ggml layout. A one-layer pool still has to hold local slot 144."""
+    from freetoken.engine.engine import Engine
+    from freetoken.moe.pool_policy import split_slots
+
+    groups = [[0], [1, 2], list(range(3, 42))]
+    eng = SimpleNamespace(
+        config=SimpleNamespace(
+            model_config=SimpleNamespace(num_experts=288, num_experts_per_tok=8),
+            ep_info=SimpleNamespace(size=2),
+        ),
+        _moe_pool_groups=groups,
+        _moe_slot_limit=None,
+    )
+    pools = Engine._moe_pools(eng, 1)
+    sizes = split_slots(3692, pools)
+    assert min(sizes) >= 145 and sum(sizes) == 3692
+
+    eng.config.ep_info = SimpleNamespace(size=1)
+    one = Engine._moe_pools(eng, 1)
+    assert [pool.min_num_slots for pool in one] == [8, 8, 8]

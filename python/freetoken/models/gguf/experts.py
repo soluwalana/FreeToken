@@ -2,7 +2,9 @@
 
 Each layer keeps its own ggml types, so each layer gets its own bank shapes: ``gate_up`` [E, 2I, row_bytes] (expert e's gate rows, then its up rows) and ``down`` [E, H, row_bytes]; float experts keep their dtype ([E, 2I, H] and [E, H, I]).
 A GGUF that stores ``ffn_gate_up_exps`` (gemma4) already holds the gate_up rows in that order.
-When NVFP4 experts carry per-expert ``.scale`` tensors, every layer also gets ``global`` [E, 4] fp32: the (gate, up, down, 1) weight_scale_2, 1 where a tensor has none."""
+When NVFP4 experts carry per-expert ``.scale`` tensors, every layer also gets ``global`` [E, 4] fp32: the (gate, up, down, 1) weight_scale_2, 1 where a tensor has none.
+Expert parallel uses the same stripe as the other formats (``id % size == rank``). E above is then this rank's bank rows: the owned experts plus one zero pad row. The file still holds every expert; each rank copies only its own.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +29,30 @@ def _expert_rows(info: GgufTensorInfo) -> torch.Tensor:
     raw = torch.from_numpy(info.data()).view(experts, rows, info.nbytes // (experts * rows))
     dtype = float_dtype(info.ggml_type)
     return raw if dtype is None else raw.view(dtype)
+
+
+def _rank_rows(experts: int) -> tuple[int, int]:
+    """Owned experts and bank rows. Size 1 keeps every expert and adds no pad row."""
+    from freetoken.distributed import get_ep_info
+    from freetoken.moe.expert_parallel import bank_geometry
+
+    return bank_geometry(experts, get_ep_info().size)
+
+
+def _owned(tensor: torch.Tensor) -> torch.Tensor:
+    """Rows this rank owns, in local-row order (``local = id // size`` for ``id % size == rank``)."""
+    from freetoken.distributed import get_ep_info
+
+    info = get_ep_info()
+    if info.size <= 1:
+        return tensor
+    return tensor[info.rank :: info.size]
+
+
+def _copy_owned(dest: torch.Tensor, src: torch.Tensor, owned: int, bank_rows: int) -> None:
+    dest[:owned].copy_(_owned(src))
+    if bank_rows != owned:
+        dest[owned:].zero_()
 
 
 def _drop_page_cache(info: GgufTensorInfo) -> None:
@@ -73,6 +99,7 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
     sources: dict[str, list[torch.Tensor]] = {role: [] for role in roles}
     tails: dict[str, list[int]] = {role: [] for role in roles}
     tags = []
+    owned = experts = 0
     with PinPipeline() if device is None else contextlib.nullcontext() as pins:
         for layer in range(num_layers):
             blk = f"blk.{first_layer + layer}"
@@ -92,31 +119,37 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
                 tails["global"].append(0)
             rows = [_expert_rows(info) for info in parts]
             d = _expert_rows(down)
-            gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
             experts = rows[0].shape[0]
+            owned, bank_rows = _rank_rows(experts)
+            if bank_rows != owned and any(t.shape[0] != experts for t in (*rows, d)):
+                raise ValueError(f"{blk}: expert tensors disagree on the expert count")
+            gate_up_shape = (bank_rows, sum(r.shape[1] for r in rows), rows[0].shape[2])
+            down_shape = (bank_rows, *d.shape[1:])
             if device is None:
-                host = {"gate_up": HostBank(gate_up_shape, rows[0].dtype), "down": HostBank(tuple(d.shape), d.dtype)}
+                host = {"gate_up": HostBank(gate_up_shape, rows[0].dtype), "down": HostBank(down_shape, d.dtype)}
                 if scaled:
-                    host["global"] = HostBank((experts, 4), torch.float32)
+                    host["global"] = HostBank((bank_rows, 4), torch.float32)
                 banks = {role: bank.tensor for role, bank in host.items()}
             else:
                 banks = {
                     "gate_up": _device_bank(gate_up_shape, gate.ggml_type, gate.ne[0], rows[0].dtype, device),
-                    "down": _device_bank(tuple(d.shape), down.ggml_type, down.ne[0], d.dtype, device),
+                    "down": _device_bank(down_shape, down.ggml_type, down.ne[0], d.dtype, device),
                 }
                 if scaled:
-                    banks["global"] = torch.empty(experts, 4, dtype=torch.float32, device=device)
+                    banks["global"] = torch.empty(bank_rows, 4, dtype=torch.float32, device=device)
             if scaled:
-                banks["global"].copy_(_expert_scales(parts, down, experts))
+                # pad scale stays 1, matching a tensor that has no weight_scale_2
+                banks["global"].fill_(1)
+                banks["global"][:owned].copy_(_owned(_expert_scales(parts, down, experts)))
             if dummy:
                 banks["gate_up"].zero_()
                 banks["down"].zero_()
             else:
                 start = 0
                 for r in rows:
-                    banks["gate_up"][:, start : start + r.shape[1]].copy_(r)
+                    _copy_owned(banks["gate_up"][:, start : start + r.shape[1]], r, owned, bank_rows)
                     start += r.shape[1]
-                banks["down"].copy_(d)
+                _copy_owned(banks["down"], d, owned, bank_rows)
                 for info in (*parts, down):
                     _drop_page_cache(info)
             if device is None:
@@ -124,7 +157,11 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             for role, bank in banks.items():
                 sources[role].append(bank)
     total = sum(t.numel() * t.element_size() for ts in sources.values() for t in ts)
-    logger.info_rank0(f"GGUF expert banks: {num_layers} layers, {total / 2**30:.1f} GiB {'on ' + str(device) if device is not None else 'in host RAM'}")
+    where = f"on {device}" if device is not None else "in host RAM"
+    shard = ""
+    if sources["gate_up"] and sources["gate_up"][0].shape[0] != owned:
+        shard = f", {owned} of {experts} experts"
+    logger.info_rank0(f"GGUF expert banks: {num_layers} layers{shard}, {total / 2**30:.1f} GiB {where}")
     return ExpertBanks("gguf_scaled" if scaled else "gguf", sources, kind=QuantKind.GGUF, kernel="ggml", layout=None, layer_tags=tags, row_tail_bytes=tails)
 
 
